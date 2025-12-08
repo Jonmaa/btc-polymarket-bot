@@ -23,7 +23,8 @@ Returns `market_id`, `yes_token_id`, `no_token_id`, and outcomes; `main` does th
 
 ## Configuration
 Environment variables (defaults in `src/config.py`):
-- `POLYMARKET_API_KEY` / `POLYMARKET_API_SECRET` / `POLYMARKET_API_PASSPHRASE`: credentials (passphrase used for user channel; current bot still uses stub orders).
+- `POLYMARKET_API_KEY` / `POLYMARKET_API_SECRET` / `POLYMARKET_API_PASSPHRASE`: credentials (passphrase used for user channel).
+- `POLYMARKET_PRIVATE_KEY` / `POLYMARKET_SIGNATURE_TYPE` / `POLYMARKET_FUNDER`: signing key + params for live orders (`py_clob_client`). `POLYMARKET_SIGNATURE_TYPE` defaults to 1; `POLYMARKET_FUNDER` optional (only if funds come from a different address).
 - `POLYMARKET_MARKET_SLUG`: base slug to start the rotation.
 - `POLYMARKET_MARKET_ID`, `POLYMARKET_YES_TOKEN_ID`, `POLYMARKET_NO_TOKEN_ID`: optional overrides; typically left blank because the bot fetches them from the slug.
 - `POLYMARKET_WS_URL`: websocket endpoint (default `wss://ws-subscriptions-clob.polymarket.com`).
@@ -32,14 +33,23 @@ Environment variables (defaults in `src/config.py`):
 - `ORDER_SIZE`: per-order size (default 50).
 - `YES_BUY_THRESHOLD` / `NO_BUY_THRESHOLD`: price thresholds to consider a buy (defaults 0.45 / 0.45).
 - `VERBOSE`: set `true` to print current UP/DOWN prices, connection info, and trade simulations.
+- `DRY_RUN`: set `true` to simulate orders without sending them (still updates internal state and prints trades as BUY UP/DOWN).
+- `SIM_BALANCE`: simulated balance (price*size units, e.g., USD) used in dry-run to gate orders and report remaining balance.
+- `COOLDOWN_SECONDS`: minimum seconds between buys (default 10).
 
 ## Current behavior
 - Connects to the market websocket channel and subscribes with the current UP/DOWN token IDs.
 - Continuously tracks best prices; prints `[price] UP=<p> DOWN=<p>` when updates arrive (verbose mode).
-- Simulates buys when thresholds and pair-cost/balance checks pass; updates internal state to track the hedge and pair cost.
+- Buys when thresholds and pair-cost/balance checks pass; updates internal state to track the hedge and pair cost.
+- In dry-run (`DRY_RUN=true`): orders are simulated, balance is decremented from `SIM_BALANCE`, and trades print as `BUY UP/DOWN ... state=UP qty=... | DOWN qty=...`.
+- In live mode (`DRY_RUN=false`): sends signed orders via `py_clob_client`; assumes immediate fill and updates state; errors are logged in verbose mode.
 - Stops a window when the lock condition is met (`pair_cost < 1` and `min(qty_yes, qty_no) > cost_yes + cost_no`) or when the market window end time is reached.
 - Automatically advances to the next 15m slug.
 
 ## Notes
-- `place_order_stub` does **not** place real orders (no auth/no signature). Replace with signed trading messages on the user channel to trade live.
+- Real orders use `py_clob_client`, but fills/cancels are still assumed—subscribe to the user channel to confirm fills in production.
 - Add persistence/logging and reconnection handling for production use.
+
+## Test mode vs live trading
+- **Test (dry-run)**: set `DRY_RUN=true` and a `SIM_BALANCE` (e.g., 1000). The bot will simulate buys, respect thresholds/cooldown, decrement the simulated balance, and print trades. No funds are touched.
+- **Live**: set `DRY_RUN=false`, provide `POLYMARKET_PRIVATE_KEY` (and optionally `POLYMARKET_FUNDER`, `POLYMARKET_SIGNATURE_TYPE`). Ensure you have funds on that address. Trades will be sent signed to the CLOB. Keep thresholds/cooldown conservative and monitor fills.

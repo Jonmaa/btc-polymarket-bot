@@ -13,6 +13,8 @@ import httpx
 
 
 def fetch_market_from_slug(slug: str) -> Dict[str, str]:
+    # Allow slugs that include query params (e.g., copied from the browser)
+    slug = slug.split("?")[0]
     url = f"https://polymarket.com/event/{slug}"
     resp = httpx.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
     resp.raise_for_status()

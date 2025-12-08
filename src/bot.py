@@ -1,10 +1,12 @@
 import asyncio
+import math
 from datetime import datetime
 from typing import Optional
 
 from .config import Settings
 from .state import TradeState
-from .client import OrderBookStream, place_order_stub
+from .client import OrderBookStream
+from .trading import place_order
 
 
 class HedgedBot:
@@ -15,18 +17,29 @@ class HedgedBot:
         self.msg_count = 0
         self.last_up = None
         self.last_down = None
+        self.last_trade_at: datetime | None = None
+        self.sim_balance = settings.sim_balance if settings.dry_run else None
 
     def should_buy(self, side: str, price: float, qty: float) -> bool:
         candidate = self.state.simulate_buy(side, price, qty)
         pair_cost, _, _ = candidate.pair_cost()
-        if pair_cost >= self.settings.target_pair_cost:
-            return False
+        # Allow seeding the first leg even if pair_cost is infinite (one side empty).
+        if math.isfinite(pair_cost):
+            if pair_cost >= self.settings.target_pair_cost:
+                return False
         qy, qn = candidate.qty_yes, candidate.qty_no
+        if min(qy, qn) == 0 and max(qy, qn) > 0:
+            # Allow the first leg without balance check.
+            return True
         if max(qy, qn) > 0:
             imbalance = abs(qy - qn) / max(qy, qn)
             if imbalance > self.settings.balance_slack:
                 return False
         return True
+
+    def _state_summary(self) -> str:
+        # Map internal YES->DOWN, NO->UP for display
+        return f"UP qty={self.state.qty_no:.2f} cost={self.state.cost_no:.2f} | DOWN qty={self.state.qty_yes:.2f} cost={self.state.cost_yes:.2f}"
 
     def lock_condition(self) -> bool:
         pair_cost, _, _ = self.state.pair_cost()
@@ -100,31 +113,64 @@ class HedgedBot:
                         if self.settings.verbose and (best_bid is not None or best_ask is not None):
                             print(f"[price] UP={self.last_up} DOWN={self.last_down}")
 
+                        now = datetime.utcnow()
                         if best_bid is not None and best_bid < self.settings.yes_buy_threshold:
                             if self.should_buy("YES", best_bid, self.settings.order_size):
-                                await place_order_stub(
-                                    stream._conn.send,
-                                    side="YES",
-                                    token_id=self.settings.yes_token_id,
-                                    price=best_bid,
-                                    size=self.settings.order_size,
-                                )
-                                self.state.update_after_fill("YES", best_bid, self.settings.order_size)
-                                if self.settings.verbose:
-                                    print(f"[trade] BUY YES @{best_bid} size={self.settings.order_size} state={self.state}")
+                                if self.last_trade_at and (now - self.last_trade_at).total_seconds() < self.settings.cooldown_seconds:
+                                    pass  # silent cooldown
+                                else:
+                                    try:
+                                        cost = best_bid * self.settings.order_size
+                                        if self.sim_balance is not None and cost > self.sim_balance:
+                                            continue
+                                        if self.settings.dry_run:
+                                            print(f"[trade] DRY-RUN BUY DOWN @{best_bid} size={self.settings.order_size}")
+                                        else:
+                                            await asyncio.to_thread(
+                                                place_order,
+                                                self.settings,
+                                                side="BUY",
+                                                token_id=self.settings.yes_token_id,
+                                                price=best_bid,
+                                                size=self.settings.order_size,
+                                            )
+                                        self.state.update_after_fill("YES", best_bid, self.settings.order_size)
+                                        if self.sim_balance is not None:
+                                            self.sim_balance -= cost
+                                        print(f"[trade] BUY DOWN @{best_bid} size={self.settings.order_size} state={self._state_summary()} bal={self.sim_balance if self.sim_balance is not None else 'n/a'}")
+                                        self.last_trade_at = now
+                                    except Exception as exc:
+                                        if self.settings.verbose:
+                                            print(f"[trade] BUY DOWN failed: {exc}")
 
                         if best_ask is not None and best_ask < self.settings.no_buy_threshold:
                             if self.should_buy("NO", best_ask, self.settings.order_size):
-                                await place_order_stub(
-                                    stream._conn.send,
-                                    side="NO",
-                                    token_id=self.settings.no_token_id,
-                                    price=best_ask,
-                                    size=self.settings.order_size,
-                                )
-                                self.state.update_after_fill("NO", best_ask, self.settings.order_size)
-                                if self.settings.verbose:
-                                    print(f"[trade] BUY NO @{best_ask} size={self.settings.order_size} state={self.state}")
+                                if self.last_trade_at and (now - self.last_trade_at).total_seconds() < self.settings.cooldown_seconds:
+                                    pass  # silent cooldown
+                                else:
+                                    try:
+                                        cost = best_ask * self.settings.order_size
+                                        if self.sim_balance is not None and cost > self.sim_balance:
+                                            continue
+                                        if self.settings.dry_run:
+                                            print(f"[trade] DRY-RUN BUY UP @{best_ask} size={self.settings.order_size}")
+                                        else:
+                                            await asyncio.to_thread(
+                                                place_order,
+                                                self.settings,
+                                                side="BUY",
+                                                token_id=self.settings.no_token_id,
+                                                price=best_ask,
+                                                size=self.settings.order_size,
+                                            )
+                                        self.state.update_after_fill("NO", best_ask, self.settings.order_size)
+                                        if self.sim_balance is not None:
+                                            self.sim_balance -= cost
+                                        print(f"[trade] BUY UP @{best_ask} size={self.settings.order_size} state={self._state_summary()} bal={self.sim_balance if self.sim_balance is not None else 'n/a'}")
+                                        self.last_trade_at = now
+                                    except Exception as exc:
+                                        if self.settings.verbose:
+                                            print(f"[trade] BUY UP failed: {exc}")
 
                         if self.lock_condition():
                             if self.settings.verbose:
