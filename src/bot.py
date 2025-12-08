@@ -57,10 +57,11 @@ class HedgedBot:
     def _label_for_asset(self, asset_id: str | None) -> str:
         if not asset_id:
             return "?"
+        # Swap mapping if observed reversed on the feed
         if asset_id == self.settings.yes_token_id:
-            return "UP"
-        if asset_id == self.settings.no_token_id:
             return "DOWN"
+        if asset_id == self.settings.no_token_id:
+            return "UP"
         return "?"
 
     async def run_once(self) -> Optional[str]:
