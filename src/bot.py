@@ -38,7 +38,7 @@ class HedgedBot:
         return True
 
     def _state_summary(self) -> str:
-        # Map internal YES->DOWN, NO->UP for display
+        # Display state using feed-observed mapping: YES->DOWN, NO->UP
         return f"UP qty={self.state.qty_no:.2f} cost={self.state.cost_no:.2f} | DOWN qty={self.state.qty_yes:.2f} cost={self.state.cost_yes:.2f}"
 
     def lock_condition(self) -> bool:
@@ -70,7 +70,7 @@ class HedgedBot:
     def _label_for_asset(self, asset_id: str | None) -> str:
         if not asset_id:
             return "?"
-        # Swap mapping if observed reversed on the feed
+        # Observed mapping: YES token = DOWN, NO token = UP
         if asset_id == self.settings.yes_token_id:
             return "DOWN"
         if asset_id == self.settings.no_token_id:
@@ -114,8 +114,10 @@ class HedgedBot:
                             print(f"[price] UP={self.last_up} DOWN={self.last_down}")
 
                         now = datetime.utcnow()
-                        if best_bid is not None and best_bid < self.settings.yes_buy_threshold:
-                            if self.should_buy("YES", best_bid, self.settings.order_size):
+
+                        # Observed mapping: UP uses NO token (best_bid), DOWN uses YES token (best_ask)
+                        if label == "UP" and best_bid is not None and best_bid < self.settings.no_buy_threshold:
+                            if self.should_buy("NO", best_bid, self.settings.order_size):
                                 if self.last_trade_at and (now - self.last_trade_at).total_seconds() < self.settings.cooldown_seconds:
                                     pass  # silent cooldown
                                 else:
@@ -124,27 +126,27 @@ class HedgedBot:
                                         if self.sim_balance is not None and cost > self.sim_balance:
                                             continue
                                         if self.settings.dry_run:
-                                            print(f"[trade] DRY-RUN BUY DOWN @{best_bid} size={self.settings.order_size}")
+                                            print(f"[trade] DRY-RUN BUY UP @{best_bid} size={self.settings.order_size}")
                                         else:
                                             await asyncio.to_thread(
                                                 place_order,
                                                 self.settings,
                                                 side="BUY",
-                                                token_id=self.settings.yes_token_id,
+                                                token_id=self.settings.no_token_id,
                                                 price=best_bid,
                                                 size=self.settings.order_size,
                                             )
-                                        self.state.update_after_fill("YES", best_bid, self.settings.order_size)
+                                        self.state.update_after_fill("NO", best_bid, self.settings.order_size)
                                         if self.sim_balance is not None:
                                             self.sim_balance -= cost
-                                        print(f"[trade] BUY DOWN @{best_bid} size={self.settings.order_size} state={self._state_summary()} bal={self.sim_balance if self.sim_balance is not None else 'n/a'}")
+                                        print(f"[trade] BUY UP @{best_bid} size={self.settings.order_size} state={self._state_summary()} bal={self.sim_balance if self.sim_balance is not None else 'n/a'}")
                                         self.last_trade_at = now
                                     except Exception as exc:
                                         if self.settings.verbose:
-                                            print(f"[trade] BUY DOWN failed: {exc}")
+                                            print(f"[trade] BUY UP failed: {exc}")
 
-                        if best_ask is not None and best_ask < self.settings.no_buy_threshold:
-                            if self.should_buy("NO", best_ask, self.settings.order_size):
+                        if label == "DOWN" and best_ask is not None and best_ask < self.settings.yes_buy_threshold:
+                            if self.should_buy("YES", best_ask, self.settings.order_size):
                                 if self.last_trade_at and (now - self.last_trade_at).total_seconds() < self.settings.cooldown_seconds:
                                     pass  # silent cooldown
                                 else:
@@ -153,24 +155,24 @@ class HedgedBot:
                                         if self.sim_balance is not None and cost > self.sim_balance:
                                             continue
                                         if self.settings.dry_run:
-                                            print(f"[trade] DRY-RUN BUY UP @{best_ask} size={self.settings.order_size}")
+                                            print(f"[trade] DRY-RUN BUY DOWN @{best_ask} size={self.settings.order_size}")
                                         else:
                                             await asyncio.to_thread(
                                                 place_order,
                                                 self.settings,
                                                 side="BUY",
-                                                token_id=self.settings.no_token_id,
+                                                token_id=self.settings.yes_token_id,
                                                 price=best_ask,
                                                 size=self.settings.order_size,
                                             )
-                                        self.state.update_after_fill("NO", best_ask, self.settings.order_size)
+                                        self.state.update_after_fill("YES", best_ask, self.settings.order_size)
                                         if self.sim_balance is not None:
                                             self.sim_balance -= cost
-                                        print(f"[trade] BUY UP @{best_ask} size={self.settings.order_size} state={self._state_summary()} bal={self.sim_balance if self.sim_balance is not None else 'n/a'}")
+                                        print(f"[trade] BUY DOWN @{best_ask} size={self.settings.order_size} state={self._state_summary()} bal={self.sim_balance if self.sim_balance is not None else 'n/a'}")
                                         self.last_trade_at = now
                                     except Exception as exc:
                                         if self.settings.verbose:
-                                            print(f"[trade] BUY UP failed: {exc}")
+                                            print(f"[trade] BUY DOWN failed: {exc}")
 
                         if self.lock_condition():
                             if self.settings.verbose:
