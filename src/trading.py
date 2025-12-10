@@ -3,34 +3,69 @@ import logging
 from typing import Optional
 
 from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import BalanceAllowanceParams, AssetType, OrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
 
 from .config import Settings
 
 logger = logging.getLogger(__name__)
 
 
-@functools.lru_cache(maxsize=1)
-def _client(settings_key: str, key: str, signature_type: int, funder: str) -> ClobClient:
-    host = "https://clob.polymarket.com"
-    return ClobClient(host, key=key, chain_id=137, signature_type=signature_type, funder=funder or None)
-
+_cached_client = None
 
 def get_client(settings: Settings) -> ClobClient:
+    global _cached_client
+    
+    if _cached_client is not None:
+        return _cached_client
+    
     if not settings.private_key:
         raise RuntimeError("POLYMARKET_PRIVATE_KEY is required for trading")
-    return _client("default", settings.private_key, settings.signature_type, settings.funder)
+    
+    host = "https://clob.polymarket.com"
+    
+    # Create client with signature_type=1 for Magic/Email accounts
+    _cached_client = ClobClient(
+        host, 
+        key=settings.private_key.strip(), 
+        chain_id=137, 
+        signature_type=settings.signature_type, 
+        funder=settings.funder.strip() if settings.funder else None
+    )
+    
+    # Derive API credentials - simple method that works
+    logger.info("Deriving User API credentials from private key...")
+    derived_creds = _cached_client.create_or_derive_api_creds()
+    _cached_client.set_api_creds(derived_creds)
+    
+    logger.info("✅ API credentials configured")
+    logger.info(f"   API Key: {derived_creds.api_key}")
+    logger.info(f"   Wallet: {_cached_client.get_address()}")
+    logger.info(f"   Funder: {settings.funder}")
+    
+    return _cached_client
 
 
 def get_balance(settings: Settings) -> float:
     """Get USDC balance from Polymarket account."""
     try:
         client = get_client(settings)
-        # Get balances - returns dict with token addresses as keys
-        balances = client.get_balance_allowance()
-        # USDC on Polygon address
-        usdc_address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-        balance = float(balances.get(usdc_address, {}).get("balance", 0))
-        return balance
+        # Get USDC (COLLATERAL) balance
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=settings.signature_type
+        )
+        result = client.get_balance_allowance(params)
+        
+        if isinstance(result, dict):
+            balance_raw = result.get("balance", "0")
+            balance_wei = float(balance_raw)
+            # USDC has 6 decimals
+            balance_usdc = balance_wei / 1_000_000
+            return balance_usdc
+        
+        logger.warning(f"Respuesta inesperada obteniendo balance: {result}")
+        return 0.0
     except Exception as e:
         logger.error(f"Error getting balance: {e}")
         return 0.0
@@ -49,14 +84,21 @@ def place_order(settings: Settings, *, side: str, token_id: str, price: float, s
         raise ValueError("side must be BUY or SELL")
 
     client = get_client(settings)
-    payload = {
-        "price": price,
-        "size": size,
-        "side": side_up,
-        "token_id": token_id,
-        "time_in_force": tif,
-    }
+    
     try:
-        return client.place_order(payload)
+        # Create order args
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=BUY if side_up == "BUY" else SELL
+        )
+        
+        # DO NOT use PartialCreateOrderOptions(neg_risk=True) - it causes "invalid signature"
+        # The client will auto-detect neg_risk from the token_id
+        signed_order = client.create_order(order_args)
+        
+        # Post order as GTC (Good-Til-Cancelled)
+        return client.post_order(signed_order, OrderType.GTC)
     except Exception as exc:  # pragma: no cover - passthrough from client
         raise RuntimeError(f"place_order failed: {exc}") from exc

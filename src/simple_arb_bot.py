@@ -1,8 +1,8 @@
 """
-Bot de arbitraje simple para Bitcoin 15min siguiendo la estrategia de Jeremy Whittaker.
+Simple arbitrage bot for Bitcoin 15min markets following Jeremy Whittaker's strategy.
 
-Estrategia: Comprar ambos lados (UP y DOWN) cuando el costo total < $1.00
-para garantizar ganancias independientemente del resultado.
+Strategy: Buy both sides (UP and DOWN) when total cost < $1.00
+to guarantee profits regardless of the outcome.
 """
 
 import asyncio
@@ -25,66 +25,66 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Deshabilitar logs HTTP de httpx
+# Disable HTTP logs from httpx
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def find_current_btc_15min_market() -> str:
     """
-    Busca el mercado activo de BTC 15min actual en Polymarket.
+    Find the current active BTC 15min market on Polymarket.
     
-    Busca mercados que coincidan con el patrón 'btc-updown-15m-<timestamp>'
-    y devuelve el slug del mercado más reciente/activo.
+    Searches for markets matching the pattern 'btc-updown-15m-<timestamp>'
+    and returns the slug of the most recent/active market.
     """
-    logger.info("Buscando mercado BTC 15min actual...")
+    logger.info("Searching for current BTC 15min market...")
     
     try:
-        # Buscar en la página de crypto 15min de Polymarket
+        # Search on Polymarket's crypto 15min page
         page_url = "https://polymarket.com/crypto/15M"
         resp = httpx.get(page_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         resp.raise_for_status()
         
-        # Buscar el slug del mercado BTC en el HTML
+        # Find the BTC market slug in the HTML
         pattern = r'btc-updown-15m-(\d+)'
         matches = re.findall(pattern, resp.text)
         
         if not matches:
-            raise RuntimeError("No se encontró ningún mercado BTC 15min activo")
+            raise RuntimeError("No active BTC 15min market found")
         
-        # Obtener el timestamp más reciente (el mercado más actual)
+        # Get the most recent timestamp (the most current market)
         latest_timestamp = max(int(ts) for ts in matches)
         slug = f"btc-updown-15m-{latest_timestamp}"
         
-        logger.info(f"✅ Mercado encontrado: {slug}")
+        logger.info(f"✅ Market found: {slug}")
         return slug
         
     except Exception as e:
-        logger.error(f"Error buscando mercado BTC 15min: {e}")
-        # Fallback: intentar con el último conocido
-        logger.warning("Usando mercado por defecto de configuración...")
+        logger.error(f"Error searching for BTC 15min market: {e}")
+        # Fallback: try with the last known one
+        logger.warning("Using default market from configuration...")
         raise
 
 
 class SimpleArbitrageBot:
-    """Bot simple que implementa la estrategia de Jeremy Whittaker."""
+    """Simple bot implementing Jeremy Whittaker's strategy."""
     
     def __init__(self, settings):
         self.settings = settings
         self.client = get_client(settings)
         
-        # Intentar buscar mercado BTC 15min actual automáticamente
+        # Try to find current BTC 15min market automatically
         try:
             market_slug = find_current_btc_15min_market()
         except Exception as e:
-            # Fallback: usar el slug configurado en .env
+            # Fallback: use the slug configured in .env
             if settings.market_slug:
-                logger.info(f"Usando mercado configurado: {settings.market_slug}")
+                logger.info(f"Using configured market: {settings.market_slug}")
                 market_slug = settings.market_slug
             else:
-                raise RuntimeError("No se pudo encontrar mercado BTC 15min y no hay slug configurado en .env")
+                raise RuntimeError("Could not find BTC 15min market and no slug configured in .env")
         
-        # Obtener token IDs del mercado
-        logger.info(f"Obteniendo información del mercado: {market_slug}")
+        # Get token IDs from the market
+        logger.info(f"Getting market information: {market_slug}")
         market_info = fetch_market_from_slug(market_slug)
         
         self.market_id = market_info["market_id"]
@@ -95,9 +95,9 @@ class SimpleArbitrageBot:
         logger.info(f"UP Token (YES): {self.yes_token_id}")
         logger.info(f"DOWN Token (NO): {self.no_token_id}")
         
-        # Extraer timestamp del mercado para calcular tiempo restante
-        # El timestamp en el slug es cuando ABRE, no cuando cierra
-        # Los mercados 15min cierran 15 minutos (900 segundos) después
+        # Extract market timestamp to calculate remaining time
+        # The timestamp in the slug is when it OPENS, not when it closes
+        # 15min markets close 15 minutes (900 seconds) later
         import re
         match = re.search(r'btc-updown-15m-(\d+)', market_slug)
         market_start = int(match.group(1)) if match else None
@@ -108,22 +108,22 @@ class SimpleArbitrageBot:
         self.opportunities_found = 0
         self.trades_executed = 0
         
-        # Tracking de inversión
+        # Investment tracking
         self.total_invested = 0.0
         self.total_shares_bought = 0
-        self.positions = []  # Lista de posiciones abiertas
+        self.positions = []  # List of open positions
     
     def get_time_remaining(self) -> str:
-        """Obtener tiempo restante hasta que cierre el mercado."""
+        """Get remaining time until market closes."""
         if not self.market_end_timestamp:
-            return "Desconocido"
+            return "Unknown"
         
         from datetime import datetime
         now = int(datetime.now().timestamp())
         remaining = self.market_end_timestamp - now
         
         if remaining <= 0:
-            return "CERRADO"
+            return "CLOSED"
         
         minutes = int(remaining // 60)
         seconds = int(remaining % 60)
@@ -135,63 +135,64 @@ class SimpleArbitrageBot:
         return get_balance(self.settings)
     
     def get_current_prices(self) -> tuple[Optional[float], Optional[float]]:
-        """Obtener precios actuales de ambos lados."""
+        """Get current prices for both sides."""
         try:
-            # Precio UP (token YES)
+            # UP price (YES token)
             up_response = self.client.get_last_trade_price(token_id=self.yes_token_id)
             price_up = float(up_response.get("price", 0))
             
-            # Precio DOWN (token NO)
+            # DOWN price (NO token)
             down_response = self.client.get_last_trade_price(token_id=self.no_token_id)
             price_down = float(down_response.get("price", 0))
             
             return price_up, price_down
         except Exception as e:
-            logger.error(f"Error obteniendo precios: {e}")
+            logger.error(f"Error getting prices: {e}")
             return None, None
     
     def get_order_book(self, token_id: str) -> dict:
-        """Obtener order book para un token."""
+        """Get order book for a token."""
         try:
             book = self.client.get_order_book(token_id=token_id)
-            bids = book.get("bids", [])
-            asks = book.get("asks", [])
+            # The result is an OrderBookSummary object, not a dict
+            bids = book.bids if hasattr(book, 'bids') and book.bids else []
+            asks = book.asks if hasattr(book, 'asks') and book.asks else []
             
-            best_bid = float(bids[0]["price"]) if bids else None
-            best_ask = float(asks[0]["price"]) if asks else None
+            best_bid = float(bids[0].price) if bids else None
+            best_ask = float(asks[0].price) if asks else None
             spread = (best_ask - best_bid) if (best_bid and best_ask) else None
             
             return {
                 "best_bid": best_bid,
                 "best_ask": best_ask,
                 "spread": spread,
-                "bid_size": float(bids[0]["size"]) if bids else 0,
-                "ask_size": float(asks[0]["size"]) if asks else 0
+                "bid_size": float(bids[0].size) if bids else 0,
+                "ask_size": float(asks[0].size) if asks else 0
             }
         except Exception as e:
-            logger.error(f"Error obteniendo order book: {e}")
+            logger.error(f"Error getting order book: {e}")
             return {}
     
     def check_arbitrage(self) -> Optional[dict]:
         """
-        Verificar si existe oportunidad de arbitraje.
+        Check if an arbitrage opportunity exists.
         
-        Retorna dict con información si hay oportunidad, None si no.
+        Returns dict with information if opportunity exists, None otherwise.
         """
         price_up, price_down = self.get_current_prices()
         
         if price_up is None or price_down is None:
             return None
         
-        # Calcular costo total
+        # Calculate total cost
         total_cost = price_up + price_down
         
-        # Verificar si hay arbitraje (total < 1.0)
+        # Check if there's arbitrage (total < 1.0)
         if total_cost < self.settings.target_pair_cost:
             profit = 1.0 - total_cost
             profit_pct = (profit / total_cost) * 100
             
-            # Calcular con el tamaño de orden
+            # Calculate with order size
             investment = total_cost * self.settings.order_size
             expected_payout = 1.0 * self.settings.order_size
             expected_profit = expected_payout - investment
@@ -212,166 +213,155 @@ class SimpleArbitrageBot:
         return None
     
     def execute_arbitrage(self, opportunity: dict):
-        """Ejecutar el arbitraje comprando ambos lados."""
+        """Execute arbitrage by buying both sides."""
         
         logger.info("=" * 70)
-        logger.info("🎯 OPORTUNIDAD DE ARBITRAJE DETECTADA")
+        logger.info("🎯 ARBITRAGE OPPORTUNITY DETECTED")
         logger.info("=" * 70)
-        logger.info(f"Precio UP (sube):     ${opportunity['price_up']:.4f}")
-        logger.info(f"Precio DOWN (baja):   ${opportunity['price_down']:.4f}")
-        logger.info(f"Costo total:          ${opportunity['total_cost']:.4f}")
-        logger.info(f"Ganancia por share:   ${opportunity['profit_per_share']:.4f}")
-        logger.info(f"Ganancia %:           {opportunity['profit_pct']:.2f}%")
+        logger.info(f"UP price (goes up):   ${opportunity['price_up']:.4f}")
+        logger.info(f"DOWN price (goes down): ${opportunity['price_down']:.4f}")
+        logger.info(f"Total cost:           ${opportunity['total_cost']:.4f}")
+        logger.info(f"Profit per share:     ${opportunity['profit_per_share']:.4f}")
+        logger.info(f"Profit %:             {opportunity['profit_pct']:.2f}%")
         logger.info("-" * 70)
-        logger.info(f"Tamaño de orden:      {opportunity['order_size']} shares cada lado")
-        logger.info(f"Inversión total:      ${opportunity['total_investment']:.2f}")
-        logger.info(f"Pago esperado:        ${opportunity['expected_payout']:.2f}")
-        logger.info(f"GANANCIA ESPERADA:    ${opportunity['expected_profit']:.2f}")
+        logger.info(f"Order size:           {opportunity['order_size']} shares each side")
+        logger.info(f"Total investment:     ${opportunity['total_investment']:.2f}")
+        logger.info(f"Expected payout:      ${opportunity['expected_payout']:.2f}")
+        logger.info(f"EXPECTED PROFIT:      ${opportunity['expected_profit']:.2f}")
         logger.info("=" * 70)
         
         if self.settings.dry_run:
-            logger.info("🔸 MODO SIMULACIÓN - No se ejecutarán órdenes reales")
+            logger.info("🔸 SIMULATION MODE - No real orders will be executed")
             logger.info("=" * 70)
             self.opportunities_found += 1
-            # Trackear inversión simulada
+            # Track simulated investment
             self.total_invested += opportunity['total_investment']
             self.total_shares_bought += opportunity['order_size'] * 2  # UP + DOWN
             self.positions.append(opportunity)
             return
         
-        # Verificar balance antes de ejecutar (con 20% margen de seguridad)
-        logger.info("\nVerificando balance...")
+        # Check balance before executing (with 20% safety margin)
+        logger.info("\nVerifying balance...")
         current_balance = self.get_balance()
         required_balance = opportunity['total_investment'] * 1.2  # 20% safety margin
         
-        logger.info(f"Balance disponible: ${current_balance:.2f}")
-        logger.info(f"Requerido (+ 20% margen): ${required_balance:.2f}")
+        logger.info(f"Available balance: ${current_balance:.2f}")
+        logger.info(f"Required (+ 20% margin): ${required_balance:.2f}")
         
         if current_balance < required_balance:
-            logger.error(f"❌ Balance insuficiente: necesitas ${required_balance:.2f} pero tienes ${current_balance:.2f}")
-            logger.error("Se requiere 20% extra como margen de seguridad para evitar fallos a mitad de ejecución")
-            logger.error("No se ejecutará el arbitraje")
+            logger.error(f"❌ Insufficient balance: need ${required_balance:.2f} but have ${current_balance:.2f}")
+            logger.error("20% extra margin required to avoid mid-execution failures")
+            logger.error("Arbitrage will not be executed")
             return
         
-        # Verificar spreads antes de ejecutar
-        logger.info("\nVerificando spreads y liquidez...")
-        up_book = self.get_order_book(self.yes_token_id)
-        down_book = self.get_order_book(self.no_token_id)
-        
-        logger.info(f"Spread UP:   ${up_book.get('spread', 0):.4f} (liquidez: {up_book.get('ask_size', 0):.0f})")
-        logger.info(f"Spread DOWN: ${down_book.get('spread', 0):.4f} (liquidez: {down_book.get('ask_size', 0):.0f})")
-        
-        # Verificar si hay suficiente liquidez
-        if up_book.get('ask_size', 0) < self.settings.order_size:
-            logger.warning(f"⚠️ Liquidez insuficiente en UP (disponible: {up_book.get('ask_size', 0)})")
-        
-        if down_book.get('ask_size', 0) < self.settings.order_size:
-            logger.warning(f"⚠️ Liquidez insuficiente en DOWN (disponible: {down_book.get('ask_size', 0)})")
-        
         try:
-            # Ejecutar órdenes
-            logger.info("\n📤 Ejecutando órdenes...")
+            # Execute orders
+            logger.info("\n📤 Executing orders...")
             
-            # Comprar UP (token YES)
-            logger.info(f"Comprando {self.settings.order_size} shares UP @ ${opportunity['price_up']:.4f}")
+            # Use exact prices from arbitrage opportunity
+            up_price = opportunity['price_up']
+            down_price = opportunity['price_down']
+            
+            # Buy UP (YES token)
+            logger.info(f"Buying {self.settings.order_size} shares UP @ ${up_price:.4f}")
             order_up = place_order(
                 self.settings,
                 side="BUY",
                 token_id=self.yes_token_id,
-                price=opportunity['price_up'],
+                price=up_price,
                 size=self.settings.order_size
             )
-            logger.info(f"✅ Orden UP ejecutada")
+            logger.info(f"✅ UP order executed")
             
-            # Comprar DOWN (token NO)
-            logger.info(f"Comprando {self.settings.order_size} shares DOWN @ ${opportunity['price_down']:.4f}")
+            # Buy DOWN (NO token)
+            logger.info(f"Buying {self.settings.order_size} shares DOWN @ ${down_price:.4f}")
             order_down = place_order(
                 self.settings,
                 side="BUY",
                 token_id=self.no_token_id,
-                price=opportunity['price_down'],
+                price=down_price,
                 size=self.settings.order_size
             )
-            logger.info(f"✅ Orden DOWN ejecutada")
+            logger.info(f"✅ DOWN order executed")
             
             logger.info("\n" + "=" * 70)
-            logger.info("✅ ARBITRAJE EJECUTADO EXITOSAMENTE")
+            logger.info("✅ ARBITRAGE EXECUTED SUCCESSFULLY")
             logger.info("=" * 70)
             
             self.trades_executed += 1
             
-            # Trackear inversión real
+            # Track real investment
             self.total_invested += opportunity['total_investment']
             self.total_shares_bought += opportunity['order_size'] * 2  # UP + DOWN
             self.positions.append(opportunity)
             
-            # Mostrar balance actualizado
+            # Show updated balance
             new_balance = self.get_balance()
-            logger.info(f"Balance actualizado: ${new_balance:.2f}")
+            logger.info(f"Updated balance: ${new_balance:.2f}")
             
         except Exception as e:
-            logger.error(f"\n❌ Error ejecutando arbitraje: {e}")
-            logger.error("❌ Las órdenes NO se ejecutaron - el tracking no se actualizó")
+            logger.error(f"\n❌ Error executing arbitrage: {e}")
+            logger.error("❌ Orders were NOT executed - tracking was not updated")
     
     def get_market_result(self) -> Optional[str]:
-        """Obtener qué opción ganó el mercado."""
+        """Get which option won the market."""
         try:
-            # Obtener precios finales
+            # Get final prices
             price_up, price_down = self.get_current_prices()
             
             if price_up is None or price_down is None:
                 return None
             
-            # En mercados cerrados, el ganador tiene precio 1.0 y el perdedor 0.0
+            # In closed markets, winner has price 1.0 and loser 0.0
             if price_up >= 0.99:
-                return "UP (sube) 📈"
+                return "UP (goes up) 📈"
             elif price_down >= 0.99:
-                return "DOWN (baja) 📉"
+                return "DOWN (goes down) 📉"
             else:
-                # Mercado aún no resuelto, ver cuál tiene mayor probabilidad
+                # Market not resolved yet, see which has higher probability
                 if price_up > price_down:
-                    return f"UP liderando ({price_up:.2%})"
+                    return f"UP leading ({price_up:.2%})"
                 else:
-                    return f"DOWN liderando ({price_down:.2%})"
+                    return f"DOWN leading ({price_down:.2%})"
         except Exception as e:
-            logger.error(f"Error obteniendo resultado: {e}")
+            logger.error(f"Error getting result: {e}")
             return None
     
     def show_final_summary(self):
-        """Mostrar resumen final al cerrar el mercado."""
+        """Show final summary when market closes."""
         logger.info("\n" + "=" * 70)
-        logger.info("🏁 MERCADO CERRADO - RESUMEN FINAL")
+        logger.info("🏁 MARKET CLOSED - FINAL SUMMARY")
         logger.info("=" * 70)
-        logger.info(f"Mercado: {self.market_slug}")
+        logger.info(f"Market: {self.market_slug}")
         
-        # Obtener resultado del mercado
+        # Get market result
         result = self.get_market_result()
         if result:
-            logger.info(f"Resultado: {result}")
+            logger.info(f"Result: {result}")
         
-        logger.info(f"Modo: {'🔸 SIMULACIÓN' if self.settings.dry_run else '🔴 TRADING REAL'}")
+        logger.info(f"Mode: {'🔸 SIMULATION' if self.settings.dry_run else '🔴 REAL TRADING'}")
         logger.info("-" * 70)
-        logger.info(f"Total oportunidades detectadas:  {self.opportunities_found}")
-        logger.info(f"Total trades ejecutados:         {self.trades_executed if not self.settings.dry_run else self.opportunities_found}")
-        logger.info(f"Total shares compradas:          {self.total_shares_bought}")
+        logger.info(f"Total opportunities detected:    {self.opportunities_found}")
+        logger.info(f"Total trades executed:           {self.trades_executed if not self.settings.dry_run else self.opportunities_found}")
+        logger.info(f"Total shares bought:             {self.total_shares_bought}")
         logger.info("-" * 70)
-        logger.info(f"Total invertido:                 ${self.total_invested:.2f}")
+        logger.info(f"Total invested:                  ${self.total_invested:.2f}")
         
-        # Calcular ganancia esperada
-        expected_payout = (self.total_shares_bought / 2) * 1.0  # Cada par paga $1.00
+        # Calculate expected profit
+        expected_payout = (self.total_shares_bought / 2) * 1.0  # Each pair pays $1.00
         expected_profit = expected_payout - self.total_invested
         profit_pct = (expected_profit / self.total_invested * 100) if self.total_invested > 0 else 0
         
-        logger.info(f"Pago esperado al cierre:         ${expected_payout:.2f}")
-        logger.info(f"Ganancia esperada:               ${expected_profit:.2f} ({profit_pct:.2f}%)")
+        logger.info(f"Expected payout at close:        ${expected_payout:.2f}")
+        logger.info(f"Expected profit:                 ${expected_profit:.2f} ({profit_pct:.2f}%)")
         logger.info("=" * 70)
     
     def run_once(self) -> bool:
-        """Escanear una vez por oportunidades."""
-        # Verificar si el mercado cerró
+        """Scan once for opportunities."""
+        # Check if market closed
         time_remaining = self.get_time_remaining()
-        if time_remaining == "CERRADO":
-            return False  # Señal para detener el bot
+        if time_remaining == "CLOSED":
+            return False  # Signal to stop the bot
         
         opportunity = self.check_arbitrage()
         
@@ -384,23 +374,23 @@ class SimpleArbitrageBot:
                 total = price_up + price_down
                 needed = self.settings.target_pair_cost - total
                 logger.info(
-                    f"No hay arbitraje: UP=${price_up:.4f} + DOWN=${price_down:.4f} "
-                    f"= ${total:.4f} (necesita < ${self.settings.target_pair_cost:.2f}, "
-                    f"falta ${-needed:.4f}) [Tiempo restante: {time_remaining}]"
+                    f"No arbitrage: UP=${price_up:.4f} + DOWN=${price_down:.4f} "
+                    f"= ${total:.4f} (needs < ${self.settings.target_pair_cost:.2f}, "
+                    f"missing ${-needed:.4f}) [Time remaining: {time_remaining}]"
                 )
             return False
     
     async def monitor(self, interval_seconds: int = 30):
-        """Monitorear continuamente por oportunidades."""
+        """Continuously monitor for opportunities."""
         logger.info("=" * 70)
-        logger.info("🚀 BOT DE ARBITRAJE BITCOIN 15MIN INICIADO")
+        logger.info("🚀 BITCOIN 15MIN ARBITRAGE BOT STARTED")
         logger.info("=" * 70)
-        logger.info(f"Mercado: {self.market_slug}")
-        logger.info(f"Tiempo restante: {self.get_time_remaining()}")
-        logger.info(f"Modo: {'🔸 SIMULACIÓN' if self.settings.dry_run else '🔴 TRADING REAL'}")
-        logger.info(f"Umbral de costo: ${self.settings.target_pair_cost:.2f}")
-        logger.info(f"Tamaño de orden: {self.settings.order_size} shares")
-        logger.info(f"Intervalo: {interval_seconds}s")
+        logger.info(f"Market: {self.market_slug}")
+        logger.info(f"Time remaining: {self.get_time_remaining()}")
+        logger.info(f"Mode: {'🔸 SIMULATION' if self.settings.dry_run else '🔴 REAL TRADING'}")
+        logger.info(f"Cost threshold: ${self.settings.target_pair_cost:.2f}")
+        logger.info(f"Order size: {self.settings.order_size} shares")
+        logger.info(f"Interval: {interval_seconds}s")
         logger.info("=" * 70)
         logger.info("")
         
@@ -409,70 +399,70 @@ class SimpleArbitrageBot:
         try:
             while True:
                 scan_count += 1
-                logger.info(f"\n[Escaneo #{scan_count}] {datetime.now().strftime('%H:%M:%S')}")
+                logger.info(f"\n[Scan #{scan_count}] {datetime.now().strftime('%H:%M:%S')}")
                 
-                # Verificar si el mercado cerró
-                if self.get_time_remaining() == "CERRADO":
-                    logger.info("\n🚨 El mercado ha cerrado!")
+                # Check if market closed
+                if self.get_time_remaining() == "CLOSED":
+                    logger.info("\n🚨 Market has closed!")
                     self.show_final_summary()
                     
-                    # Buscar el siguiente mercado
-                    logger.info("\n🔄 Buscando siguiente mercado BTC 15min...")
+                    # Search for the next market
+                    logger.info("\n🔄 Searching for next BTC 15min market...")
                     try:
                         new_market_slug = find_current_btc_15min_market()
                         if new_market_slug != self.market_slug:
-                            logger.info(f"✅ Nuevo mercado encontrado: {new_market_slug}")
-                            logger.info("Reiniciando bot con nuevo mercado...")
-                            # Reiniciar el bot con el nuevo mercado
+                            logger.info(f"✅ New market found: {new_market_slug}")
+                            logger.info("Restarting bot with new market...")
+                            # Restart the bot with the new market
                             self.__init__(self.settings)
                             scan_count = 0
                             continue
                         else:
-                            logger.info("⏳ Esperando nuevo mercado... (30s)")
+                            logger.info("⏳ Waiting for new market... (30s)")
                             await asyncio.sleep(30)
                             continue
                     except Exception as e:
-                        logger.error(f"Error buscando nuevo mercado: {e}")
-                        logger.info("Reintentando en 30 segundos...")
+                        logger.error(f"Error searching for new market: {e}")
+                        logger.info("Retrying in 30 seconds...")
                         await asyncio.sleep(30)
                         continue
                 
                 self.run_once()
                 
-                logger.info(f"Oportunidades encontradas: {self.opportunities_found}/{scan_count}")
+                logger.info(f"Opportunities found: {self.opportunities_found}/{scan_count}")
                 if not self.settings.dry_run:
-                    logger.info(f"Trades ejecutados: {self.trades_executed}")
+                    logger.info(f"Trades executed: {self.trades_executed}")
                 
-                logger.info(f"Esperando {interval_seconds}s...\n")
+                logger.info(f"Waiting {interval_seconds}s...\n")
                 await asyncio.sleep(interval_seconds)
                 
         except KeyboardInterrupt:
             logger.info("\n" + "=" * 70)
-            logger.info("🛑 Bot detenido por usuario")
-            logger.info(f"Total escaneos: {scan_count}")
-            logger.info(f"Oportunidades encontradas: {self.opportunities_found}")
+            logger.info("🛑 Bot stopped by user")
+            logger.info(f"Total scans: {scan_count}")
+            logger.info(f"Opportunities found: {self.opportunities_found}")
             if not self.settings.dry_run:
-                logger.info(f"Trades ejecutados: {self.trades_executed}")
+                logger.info(f"Trades executed: {self.trades_executed}")
             logger.info("=" * 70)
 
 
 async def main():
-    """Punto de entrada principal."""
+    """Main entry point."""
     
-    # Cargar configuración
+    # Load configuration
     settings = load_settings()
     
-    # Validar configuración
+    # Validate configuration
     if not settings.private_key:
-        logger.error("❌ Error: POLYMARKET_PRIVATE_KEY no configurado en .env")
+        logger.error("❌ Error: POLYMARKET_PRIVATE_KEY not configured in .env")
         return
     
-    # Crear y ejecutar bot
+    # Create and run bot
     try:
         bot = SimpleArbitrageBot(settings)
         await bot.monitor(interval_seconds=0)
     except Exception as e:
-        logger.error(f"❌ Error fatal: {e}", exc_info=True)
+        logger.error(f"❌ Fatal error: {e}", exc_info=True)
 
 
 if __name__ == "__main__":

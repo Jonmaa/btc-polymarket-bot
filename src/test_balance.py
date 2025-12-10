@@ -41,20 +41,12 @@ def main():
         )
         print("   ✓ Client created")
         
-        # Use credentials from .env
-        print("\n2. Using API credentials from .env...")
-        if not (api_key and api_secret and api_passphrase):
-            print("   ✗ Error: Missing credentials in .env")
-            print("   Required: POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_API_PASSPHRASE")
-            return
-        
-        creds = ApiCreds(
-            api_key=api_key,
-            api_secret=api_secret,
-            api_passphrase=api_passphrase
-        )
+        # Derive credentials from private key
+        print("\n2. Deriving API credentials from private key...")
+        creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)
-        print("   ✓ Credentials configured from .env")
+        print(f"   ✓ API Key: {creds.api_key}")
+        print(f"   ✓ Credentials configured")
         
         # Get wallet address
         print("\n3. Getting wallet address...")
