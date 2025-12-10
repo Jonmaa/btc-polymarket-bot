@@ -98,7 +98,85 @@ def place_order(settings: Settings, *, side: str, token_id: str, price: float, s
         # The client will auto-detect neg_risk from the token_id
         signed_order = client.create_order(order_args)
         
-        # Post order as GTC (Good-Til-Cancelled)
+        # Post order as GTC (Good-Til-Cancelled) - stays in book until filled
         return client.post_order(signed_order, OrderType.GTC)
     except Exception as exc:  # pragma: no cover - passthrough from client
         raise RuntimeError(f"place_order failed: {exc}") from exc
+
+
+def place_orders_fast(settings: Settings, orders: list[dict]) -> list[dict]:
+    """
+    Place multiple orders as fast as possible.
+    
+    Strategy: Pre-sign all orders first, then post them in rapid succession.
+    This minimizes the time between order submissions.
+    
+    Args:
+        settings: Bot settings
+        orders: List of order dicts with keys: side, token_id, price, size
+        
+    Returns:
+        List of order results
+    """
+    client = get_client(settings)
+    
+    # Step 1: Pre-sign all orders (this is the slow part)
+    signed_orders = []
+    for order_params in orders:
+        side_up = order_params["side"].upper()
+        order_args = OrderArgs(
+            token_id=order_params["token_id"],
+            price=order_params["price"],
+            size=order_params["size"],
+            side=BUY if side_up == "BUY" else SELL
+        )
+        signed_order = client.create_order(order_args)
+        signed_orders.append(signed_order)
+    
+    # Step 2: Post all orders as fast as possible (GTC = stays in book until filled)
+    results = []
+    for signed_order in signed_orders:
+        try:
+            result = client.post_order(signed_order, OrderType.GTC)
+            results.append(result)
+        except Exception as e:
+            results.append({"error": str(e)})
+    
+    return results
+
+
+def get_positions(settings: Settings, token_ids: list[str] = None) -> dict:
+    """
+    Get current positions (shares owned) for the user.
+    
+    Args:
+        settings: Bot settings
+        token_ids: Optional list of token IDs to filter by
+        
+    Returns:
+        Dictionary with token_id -> position data
+    """
+    try:
+        client = get_client(settings)
+        
+        # Get all positions for the user
+        positions = client.get_positions()
+        
+        # Filter by token_ids if provided
+        result = {}
+        for pos in positions:
+            token_id = pos.get("asset", {}).get("token_id") or pos.get("token_id")
+            if token_id:
+                if token_ids is None or token_id in token_ids:
+                    size = float(pos.get("size", 0))
+                    avg_price = float(pos.get("avg_price", 0))
+                    result[token_id] = {
+                        "size": size,
+                        "avg_price": avg_price,
+                        "raw": pos
+                    }
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error getting positions: {e}")
+        return {}

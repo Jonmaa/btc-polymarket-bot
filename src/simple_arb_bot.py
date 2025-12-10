@@ -15,7 +15,7 @@ import httpx
 
 from .config import load_settings
 from .lookup import fetch_market_from_slug
-from .trading import get_client, place_order
+from .trading import get_client, place_order, get_positions, place_orders_fast
 
 
 logging.basicConfig(
@@ -112,6 +112,9 @@ class SimpleArbitrageBot:
         self.total_invested = 0.0
         self.total_shares_bought = 0
         self.positions = []  # List of open positions
+        
+        # Cached balance (updated after each trade)
+        self.cached_balance = None
     
     def get_time_remaining(self) -> str:
         """Get remaining time until market closes."""
@@ -134,21 +137,34 @@ class SimpleArbitrageBot:
         from .trading import get_balance
         return get_balance(self.settings)
     
-    def get_current_prices(self) -> tuple[Optional[float], Optional[float]]:
-        """Get current prices for both sides."""
+    def get_current_prices(self) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+        """
+        Get current prices using last trade price (like original).
+        Also gets order book liquidity to verify there are enough shares.
+        
+        Returns:
+            (up_price, down_price, up_size, down_size) - prices and available sizes
+        """
         try:
-            # UP price (YES token)
+            # Get last trade prices (original method that worked)
             up_response = self.client.get_last_trade_price(token_id=self.yes_token_id)
             price_up = float(up_response.get("price", 0))
             
-            # DOWN price (NO token)
             down_response = self.client.get_last_trade_price(token_id=self.no_token_id)
             price_down = float(down_response.get("price", 0))
             
-            return price_up, price_down
+            # Get order book to check available liquidity
+            up_book = self.get_order_book(self.yes_token_id)
+            down_book = self.get_order_book(self.no_token_id)
+            
+            # Available sizes at best ask prices
+            size_up = up_book.get("ask_size", 0)
+            size_down = down_book.get("ask_size", 0)
+            
+            return price_up, price_down, size_up, size_down
         except Exception as e:
             logger.error(f"Error getting prices: {e}")
-            return None, None
+            return None, None, None, None
     
     def get_order_book(self, token_id: str) -> dict:
         """Get order book for a token."""
@@ -177,9 +193,12 @@ class SimpleArbitrageBot:
         """
         Check if an arbitrage opportunity exists.
         
+        Uses order book (best ask) to get REAL prices we can buy at.
+        Also verifies there's enough liquidity at those prices.
+        
         Returns dict with information if opportunity exists, None otherwise.
         """
-        price_up, price_down = self.get_current_prices()
+        price_up, price_down, size_up, size_down = self.get_current_prices()
         
         if price_up is None or price_down is None:
             return None
@@ -189,6 +208,12 @@ class SimpleArbitrageBot:
         
         # Check if there's arbitrage (total < 1.0)
         if total_cost < self.settings.target_pair_cost:
+            # Verify there's enough liquidity at these prices
+            min_size = min(size_up, size_down)
+            if min_size < self.settings.order_size:
+                logger.debug(f"Insufficient liquidity: UP={size_up:.2f}, DOWN={size_down:.2f}, need={self.settings.order_size}")
+                return None
+            
             profit = 1.0 - total_cost
             profit_pct = (profit / total_cost) * 100
             
@@ -207,6 +232,8 @@ class SimpleArbitrageBot:
                 "total_investment": investment,
                 "expected_payout": expected_payout,
                 "expected_profit": expected_profit,
+                "size_up": size_up,
+                "size_down": size_down,
                 "timestamp": datetime.now().isoformat()
             }
         
@@ -214,6 +241,9 @@ class SimpleArbitrageBot:
     
     def execute_arbitrage(self, opportunity: dict):
         """Execute arbitrage by buying both sides."""
+        
+        # Count opportunity found (regardless of execution)
+        self.opportunities_found += 1
         
         logger.info("=" * 70)
         logger.info("🎯 ARBITRAGE OPPORTUNITY DETECTED")
@@ -233,7 +263,6 @@ class SimpleArbitrageBot:
         if self.settings.dry_run:
             logger.info("🔸 SIMULATION MODE - No real orders will be executed")
             logger.info("=" * 70)
-            self.opportunities_found += 1
             # Track simulated investment
             self.total_invested += opportunity['total_investment']
             self.total_shares_bought += opportunity['order_size'] * 2  # UP + DOWN
@@ -242,10 +271,16 @@ class SimpleArbitrageBot:
         
         # Check balance before executing (with 20% safety margin)
         logger.info("\nVerifying balance...")
-        current_balance = self.get_balance()
-        required_balance = opportunity['total_investment'] * 1.2  # 20% safety margin
+        # Use cached balance if available, otherwise fetch from API
+        if self.cached_balance is not None:
+            current_balance = self.cached_balance
+            logger.info(f"Available balance (cached): ${current_balance:.2f}")
+        else:
+            current_balance = self.get_balance()
+            self.cached_balance = current_balance
+            logger.info(f"Available balance: ${current_balance:.2f}")
         
-        logger.info(f"Available balance: ${current_balance:.2f}")
+        required_balance = opportunity['total_investment'] * 1.2  # 20% safety margin
         logger.info(f"Required (+ 20% margin): ${required_balance:.2f}")
         
         if current_balance < required_balance:
@@ -256,33 +291,58 @@ class SimpleArbitrageBot:
         
         try:
             # Execute orders
-            logger.info("\n📤 Executing orders...")
+            logger.info("\n📤 Executing orders IN PARALLEL...")
             
             # Use exact prices from arbitrage opportunity
             up_price = opportunity['price_up']
             down_price = opportunity['price_down']
             
-            # Buy UP (YES token)
-            logger.info(f"Buying {self.settings.order_size} shares UP @ ${up_price:.4f}")
-            order_up = place_order(
-                self.settings,
-                side="BUY",
-                token_id=self.yes_token_id,
-                price=up_price,
-                size=self.settings.order_size
-            )
-            logger.info(f"✅ UP order executed")
+            # Prepare both orders
+            orders = [
+                {
+                    "side": "BUY",
+                    "token_id": self.yes_token_id,
+                    "price": up_price,
+                    "size": self.settings.order_size
+                },
+                {
+                    "side": "BUY",
+                    "token_id": self.no_token_id,
+                    "price": down_price,
+                    "size": self.settings.order_size
+                }
+            ]
             
-            # Buy DOWN (NO token)
-            logger.info(f"Buying {self.settings.order_size} shares DOWN @ ${down_price:.4f}")
-            order_down = place_order(
-                self.settings,
-                side="BUY",
-                token_id=self.no_token_id,
-                price=down_price,
-                size=self.settings.order_size
-            )
+            logger.info(f"   UP:   {self.settings.order_size} shares @ ${up_price:.4f}")
+            logger.info(f"   DOWN: {self.settings.order_size} shares @ ${down_price:.4f}")
+            
+            # Execute both orders as fast as possible
+            results = place_orders_fast(self.settings, orders)
+            
+            # Check results
+            errors = [r for r in results if isinstance(r, dict) and "error" in r]
+            if errors:
+                for err in errors:
+                    logger.error(f"❌ Order error: {err['error']}")
+                raise RuntimeError(f"Some orders failed: {errors}")
+            
+            logger.info(f"✅ UP order executed")
             logger.info(f"✅ DOWN order executed")
+            
+            # Verify positions are balanced
+            import time
+            time.sleep(1)  # Wait for orders to settle
+            
+            positions = get_positions(self.settings, [self.yes_token_id, self.no_token_id])
+            up_shares = positions.get(self.yes_token_id, {}).get("size", 0)
+            down_shares = positions.get(self.no_token_id, {}).get("size", 0)
+            
+            if abs(up_shares - down_shares) > 0.1:
+                logger.warning(f"⚠️ POSITION IMBALANCE DETECTED!")
+                logger.warning(f"   UP shares: {up_shares:.2f}")
+                logger.warning(f"   DOWN shares: {down_shares:.2f}")
+                logger.warning(f"   Difference: {abs(up_shares - down_shares):.2f}")
+                logger.warning("   ⚠️ Manual intervention may be needed to balance positions")
             
             logger.info("\n" + "=" * 70)
             logger.info("✅ ARBITRAGE EXECUTED SUCCESSFULLY")
@@ -295,19 +355,40 @@ class SimpleArbitrageBot:
             self.total_shares_bought += opportunity['order_size'] * 2  # UP + DOWN
             self.positions.append(opportunity)
             
-            # Show updated balance
+            # Update cached balance after trade
             new_balance = self.get_balance()
-            logger.info(f"Updated balance: ${new_balance:.2f}")
+            self.cached_balance = new_balance
+            logger.info(f"💰 Updated balance: ${new_balance:.2f}")
+            
+            # Get and show current positions
+            self.show_current_positions()
             
         except Exception as e:
             logger.error(f"\n❌ Error executing arbitrage: {e}")
             logger.error("❌ Orders were NOT executed - tracking was not updated")
     
+    def show_current_positions(self):
+        """Show current share positions for UP and DOWN tokens."""
+        try:
+            positions = get_positions(self.settings, [self.yes_token_id, self.no_token_id])
+            
+            up_shares = positions.get(self.yes_token_id, {}).get("size", 0)
+            down_shares = positions.get(self.no_token_id, {}).get("size", 0)
+            
+            logger.info("-" * 70)
+            logger.info("📊 CURRENT POSITIONS:")
+            logger.info(f"   UP shares:   {up_shares:.2f}")
+            logger.info(f"   DOWN shares: {down_shares:.2f}")
+            logger.info("-" * 70)
+            
+        except Exception as e:
+            logger.warning(f"Could not fetch positions: {e}")
+    
     def get_market_result(self) -> Optional[str]:
         """Get which option won the market."""
         try:
             # Get final prices
-            price_up, price_down = self.get_current_prices()
+            price_up, price_down, _, _ = self.get_current_prices()
             
             if price_up is None or price_down is None:
                 return None
@@ -369,14 +450,14 @@ class SimpleArbitrageBot:
             self.execute_arbitrage(opportunity)
             return True
         else:
-            price_up, price_down = self.get_current_prices()
+            price_up, price_down, size_up, size_down = self.get_current_prices()
             if price_up and price_down:
                 total = price_up + price_down
                 needed = self.settings.target_pair_cost - total
                 logger.info(
-                    f"No arbitrage: UP=${price_up:.4f} + DOWN=${price_down:.4f} "
-                    f"= ${total:.4f} (needs < ${self.settings.target_pair_cost:.2f}, "
-                    f"missing ${-needed:.4f}) [Time remaining: {time_remaining}]"
+                    f"No arbitrage: UP=${price_up:.4f} ({size_up:.0f}) + DOWN=${price_down:.4f} ({size_down:.0f}) "
+                    f"= ${total:.4f} (needs <= ${self.settings.target_pair_cost:.2f}) "
+                    f"[Time: {time_remaining}]"
                 )
             return False
     
