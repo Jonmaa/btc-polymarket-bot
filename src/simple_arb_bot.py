@@ -270,6 +270,17 @@ class SimpleArbitrageBot:
         except Exception as e:
             logger.error(f"Error getting order book: {e}")
             return {}
+
+    async def _fetch_order_books_parallel(self) -> tuple[dict, dict]:
+        """Fetch UP/DOWN order books concurrently to reduce per-scan latency."""
+        try:
+            up_task = asyncio.to_thread(self.get_order_book, self.yes_token_id)
+            down_task = asyncio.to_thread(self.get_order_book, self.no_token_id)
+            up_book, down_book = await asyncio.gather(up_task, down_task)
+            return up_book, down_book
+        except Exception as e:
+            logger.warning(f"Parallel order book fetch failed, falling back to sequential: {e}")
+            return self.get_order_book(self.yes_token_id), self.get_order_book(self.no_token_id)
     
     def check_arbitrage(self, up_book: Optional[dict] = None, down_book: Optional[dict] = None) -> Optional[dict]:
         """
@@ -616,6 +627,51 @@ class SimpleArbitrageBot:
                     f"[Time: {time_remaining}]"
                 )
             return False
+
+    async def run_once_async(self) -> bool:
+        """Scan once for opportunities (async; fetches books in parallel)."""
+        # Check if market closed
+        time_remaining = self.get_time_remaining()
+        if time_remaining == "CLOSED":
+            return False  # Signal to stop the bot
+
+        # Fetch both books concurrently (reduces per-scan latency)
+        up_book, down_book = await self._fetch_order_books_parallel()
+
+        opportunity = self.check_arbitrage(up_book=up_book, down_book=down_book)
+
+        if opportunity:
+            self.execute_arbitrage(opportunity)
+            return True
+
+        price_up = up_book.get("best_ask")
+        price_down = down_book.get("best_ask")
+        size_up = up_book.get("ask_size", 0)
+        size_down = down_book.get("ask_size", 0)
+
+        if price_up is not None and price_down is not None:
+            best_total = price_up + price_down
+
+            # Compute fill-based totals for ORDER_SIZE (more accurate than best_ask)
+            fill_up = self._compute_buy_fill(up_book.get("asks", []), float(self.settings.order_size))
+            fill_down = self._compute_buy_fill(down_book.get("asks", []), float(self.settings.order_size))
+
+            fill_msg = ""
+            if fill_up and fill_down and fill_up.get("worst") is not None and fill_down.get("worst") is not None:
+                worst_total = float(fill_up["worst"]) + float(fill_down["worst"])
+                vwap_total = float(fill_up["vwap"]) + float(fill_down["vwap"]) if (fill_up.get("vwap") is not None and fill_down.get("vwap") is not None) else None
+                if vwap_total is not None:
+                    fill_msg = f" | fill(worst)=${worst_total:.4f} vwap=${vwap_total:.4f}"
+                else:
+                    fill_msg = f" | fill(worst)=${worst_total:.4f}"
+
+            logger.info(
+                f"No arbitrage: UP=${price_up:.4f} ({size_up:.0f}) + DOWN=${price_down:.4f} ({size_down:.0f}) "
+                f"= ${best_total:.4f} (threshold=${self.settings.target_pair_cost:.3f}){fill_msg} "
+                f"[Time: {time_remaining}]"
+            )
+
+        return False
     
     async def monitor(self, interval_seconds: int = 30):
         """Continuously monitor for opportunities."""
@@ -664,7 +720,8 @@ class SimpleArbitrageBot:
                         await asyncio.sleep(30)
                         continue
                 
-                self.run_once()
+                # Use async scan to fetch books in parallel
+                await self.run_once_async()
                 
                 logger.info(f"Opportunities found: {self.opportunities_found}/{scan_count}")
                 if not self.settings.dry_run:
