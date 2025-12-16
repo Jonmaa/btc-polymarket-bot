@@ -118,6 +118,7 @@ class SimpleArbitrageBot:
         
         # Simulation balance (used in dry_run mode)
         self.sim_balance = self.settings.sim_balance if self.settings.sim_balance > 0 else 100.0
+        self.sim_start_balance = self.sim_balance
     
     def get_time_remaining(self) -> str:
         """Get remaining time until market closes."""
@@ -548,12 +549,27 @@ class SimpleArbitrageBot:
         logger.info(f"Total invested:                  ${self.total_invested:.2f}")
         
         # Calculate expected profit
-        expected_payout = (self.total_shares_bought / 2) * 1.0  # Each pair pays $1.00
+        if self.settings.dry_run:
+            expected_payout = sum(float(p.get("expected_payout", 0.0)) for p in (self.positions or []))
+        else:
+            expected_payout = (self.total_shares_bought / 2) * 1.0  # Each pair pays $1.00
+
         expected_profit = expected_payout - self.total_invested
         profit_pct = (expected_profit / self.total_invested * 100) if self.total_invested > 0 else 0
         
         logger.info(f"Expected payout at close:        ${expected_payout:.2f}")
         logger.info(f"Expected profit:                 ${expected_profit:.2f} ({profit_pct:.2f}%)")
+
+        if self.settings.dry_run:
+            cash_remaining = float(self.sim_balance)
+            cash_after_claim = cash_remaining + float(expected_payout)
+            net_change = cash_after_claim - float(self.sim_start_balance)
+            net_change_pct = (net_change / float(self.sim_start_balance) * 100) if self.sim_start_balance > 0 else 0
+            logger.info("-" * 70)
+            logger.info(f"Sim start cash:                  ${self.sim_start_balance:.2f}")
+            logger.info(f"Sim cash remaining:              ${cash_remaining:.2f}")
+            logger.info(f"Sim cash after claiming:         ${cash_after_claim:.2f}")
+            logger.info(f"Sim net change:                  ${net_change:.2f} ({net_change_pct:.2f}%)")
         logger.info("=" * 70)
     
     def run_once(self) -> bool:
