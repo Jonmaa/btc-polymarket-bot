@@ -115,6 +115,9 @@ class SimpleArbitrageBot:
         
         # Cached balance (updated after each trade)
         self.cached_balance = None
+        
+        # Simulation balance (used in dry_run mode)
+        self.sim_balance = self.settings.sim_balance if self.settings.sim_balance > 0 else 100.0
     
     def get_time_remaining(self) -> str:
         """Get remaining time until market closes."""
@@ -133,38 +136,96 @@ class SimpleArbitrageBot:
         return f"{minutes}m {seconds}s"
     
     def get_balance(self) -> float:
-        """Get current USDC balance."""
+        """Get current USDC balance (or simulated balance in dry_run mode)."""
+        if self.settings.dry_run:
+            return self.sim_balance
         from .trading import get_balance
         return get_balance(self.settings)
     
     def get_current_prices(self) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         """
-        Get current prices using last trade price (like original).
-        Also gets order book liquidity to verify there are enough shares.
+        Get current prices from order book (best ask = lowest price we can BUY at).
+        
+        Using best_ask ensures we get the actual available price, not a historical
+        trade price that may no longer be available.
         
         Returns:
             (up_price, down_price, up_size, down_size) - prices and available sizes
         """
         try:
-            # Get last trade prices (original method that worked)
-            up_response = self.client.get_last_trade_price(token_id=self.yes_token_id)
-            price_up = float(up_response.get("price", 0))
-            
-            down_response = self.client.get_last_trade_price(token_id=self.no_token_id)
-            price_down = float(down_response.get("price", 0))
-            
-            # Get order book to check available liquidity
+            # Get order book for both tokens
             up_book = self.get_order_book(self.yes_token_id)
             down_book = self.get_order_book(self.no_token_id)
+            
+            # Use best_ask (lowest sell price = price we can buy at)
+            price_up = up_book.get("best_ask")
+            price_down = down_book.get("best_ask")
             
             # Available sizes at best ask prices
             size_up = up_book.get("ask_size", 0)
             size_down = down_book.get("ask_size", 0)
             
+            # If no asks available, we can't buy
+            if price_up is None or price_down is None:
+                logger.warning("No asks available in order book")
+                return None, None, None, None
+            
             return price_up, price_down, size_up, size_down
         except Exception as e:
             logger.error(f"Error getting prices: {e}")
             return None, None, None, None
+
+    def _levels_to_tuples(self, levels) -> list[tuple[float, float]]:
+        """Convert OrderSummary-like objects into (price, size) tuples."""
+        tuples: list[tuple[float, float]] = []
+        for level in levels or []:
+            try:
+                price = float(level.price)
+                size = float(level.size)
+            except Exception:
+                continue
+            if size <= 0:
+                continue
+            tuples.append((price, size))
+        return tuples
+
+    def _compute_buy_fill(self, asks: list[tuple[float, float]], target_size: float) -> Optional[dict]:
+        """
+        Compute fill information for buying `target_size` shares using the ask book.
+
+        Returns:
+            dict with keys: filled, vwap, worst, best, cost
+            or None if not enough liquidity.
+        """
+        if target_size <= 0:
+            return None
+
+        # Cheapest asks first
+        sorted_asks = sorted(asks, key=lambda x: x[0])
+        filled = 0.0
+        cost = 0.0
+        worst = None
+        best = sorted_asks[0][0] if sorted_asks else None
+
+        for price, size in sorted_asks:
+            if filled >= target_size:
+                break
+            take = min(size, target_size - filled)
+            cost += take * price
+            filled += take
+            worst = price
+
+        if filled + 1e-9 < target_size:
+            return None
+
+        vwap = cost / filled if filled > 0 else None
+        return {
+            "filled": filled,
+            "vwap": vwap,
+            "worst": worst,
+            "best": best,
+            "cost": cost,
+        }
     
     def get_order_book(self, token_id: str) -> dict:
         """Get order book for a token."""
@@ -173,23 +234,43 @@ class SimpleArbitrageBot:
             # The result is an OrderBookSummary object, not a dict
             bids = book.bids if hasattr(book, 'bids') and book.bids else []
             asks = book.asks if hasattr(book, 'asks') and book.asks else []
-            
-            best_bid = float(bids[0].price) if bids else None
-            best_ask = float(asks[0].price) if asks else None
-            spread = (best_ask - best_bid) if (best_bid and best_ask) else None
-            
+
+            bid_levels = self._levels_to_tuples(bids)
+            ask_levels = self._levels_to_tuples(asks)
+
+            best_bid = max((p for p, _ in bid_levels), default=None)
+            best_ask = min((p for p, _ in ask_levels), default=None)
+
+            bid_size = 0.0
+            if best_bid is not None:
+                for p, s in bid_levels:
+                    if p == best_bid:
+                        bid_size = s
+                        break
+
+            ask_size = 0.0
+            if best_ask is not None:
+                for p, s in ask_levels:
+                    if p == best_ask:
+                        ask_size = s
+                        break
+
+            spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
+
             return {
                 "best_bid": best_bid,
                 "best_ask": best_ask,
                 "spread": spread,
-                "bid_size": float(bids[0].size) if bids else 0,
-                "ask_size": float(asks[0].size) if asks else 0
+                "bid_size": bid_size,
+                "ask_size": ask_size,
+                "bids": bid_levels,
+                "asks": ask_levels,
             }
         except Exception as e:
             logger.error(f"Error getting order book: {e}")
             return {}
     
-    def check_arbitrage(self) -> Optional[dict]:
+    def check_arbitrage(self, up_book: Optional[dict] = None, down_book: Optional[dict] = None) -> Optional[dict]:
         """
         Check if an arbitrage opportunity exists.
         
@@ -198,33 +279,53 @@ class SimpleArbitrageBot:
         
         Returns dict with information if opportunity exists, None otherwise.
         """
-        price_up, price_down, size_up, size_down = self.get_current_prices()
-        
-        if price_up is None or price_down is None:
-            return None
-        
-        # Calculate total cost
-        total_cost = price_up + price_down
-        
-        # Check if there's arbitrage (total < 1.0)
-        if total_cost < self.settings.target_pair_cost:
-            # Verify there's enough liquidity at these prices
-            min_size = min(size_up, size_down)
-            if min_size < self.settings.order_size:
-                logger.debug(f"Insufficient liquidity: UP={size_up:.2f}, DOWN={size_down:.2f}, need={self.settings.order_size}")
+        # Pull full order books (allow caller to pass pre-fetched books to reduce latency)
+        if up_book is None:
+            up_book = self.get_order_book(self.yes_token_id)
+        if down_book is None:
+            down_book = self.get_order_book(self.no_token_id)
+
+        # Basic sanity: in a normal book, best_ask >= best_bid
+        for side_name, book in ("UP", up_book), ("DOWN", down_book):
+            best_bid = book.get("best_bid")
+            best_ask = book.get("best_ask")
+            if best_bid is not None and best_ask is not None and best_ask < best_bid:
+                logger.warning(
+                    f"{side_name} order book looks inverted (best_ask={best_ask:.4f} < best_bid={best_bid:.4f}); skipping scan"
+                )
                 return None
-            
+
+        asks_up = up_book.get("asks", [])
+        asks_down = down_book.get("asks", [])
+
+        # Compute the prices required to actually fill ORDER_SIZE shares (walk the book)
+        fill_up = self._compute_buy_fill(asks_up, float(self.settings.order_size))
+        fill_down = self._compute_buy_fill(asks_down, float(self.settings.order_size))
+
+        if not fill_up or not fill_down:
+            return None
+
+        # For guaranteed arbitrage, use the *worst* price we might have to pay to fill the size
+        limit_price_up = fill_up["worst"]
+        limit_price_down = fill_down["worst"]
+        if limit_price_up is None or limit_price_down is None:
+            return None
+
+        total_cost = limit_price_up + limit_price_down
+
+        # Use <= to avoid missing exact-threshold opportunities due to rounding
+        if total_cost <= self.settings.target_pair_cost:
             profit = 1.0 - total_cost
-            profit_pct = (profit / total_cost) * 100
-            
-            # Calculate with order size
+            profit_pct = (profit / total_cost) * 100 if total_cost > 0 else 0
+
             investment = total_cost * self.settings.order_size
             expected_payout = 1.0 * self.settings.order_size
             expected_profit = expected_payout - investment
-            
+
             return {
-                "price_up": price_up,
-                "price_down": price_down,
+                # Prices we will actually place as LIMITs (to ensure fills)
+                "price_up": limit_price_up,
+                "price_down": limit_price_down,
                 "total_cost": total_cost,
                 "profit_per_share": profit,
                 "profit_pct": profit_pct,
@@ -232,11 +333,15 @@ class SimpleArbitrageBot:
                 "total_investment": investment,
                 "expected_payout": expected_payout,
                 "expected_profit": expected_profit,
-                "size_up": size_up,
-                "size_down": size_down,
-                "timestamp": datetime.now().isoformat()
+
+                # Extra diagnostics
+                "best_ask_up": fill_up.get("best"),
+                "best_ask_down": fill_down.get("best"),
+                "vwap_up": fill_up.get("vwap"),
+                "vwap_down": fill_down.get("vwap"),
+                "timestamp": datetime.now().isoformat(),
             }
-        
+
         return None
     
     def execute_arbitrage(self, opportunity: dict):
@@ -248,8 +353,11 @@ class SimpleArbitrageBot:
         logger.info("=" * 70)
         logger.info("🎯 ARBITRAGE OPPORTUNITY DETECTED")
         logger.info("=" * 70)
-        logger.info(f"UP price (goes up):   ${opportunity['price_up']:.4f}")
-        logger.info(f"DOWN price (goes down): ${opportunity['price_down']:.4f}")
+        logger.info(f"UP limit price:       ${opportunity['price_up']:.4f}")
+        logger.info(f"DOWN limit price:     ${opportunity['price_down']:.4f}")
+        if 'vwap_up' in opportunity and 'vwap_down' in opportunity:
+            logger.info(f"UP VWAP (est):        ${opportunity['vwap_up']:.4f}")
+            logger.info(f"DOWN VWAP (est):      ${opportunity['vwap_down']:.4f}")
         logger.info(f"Total cost:           ${opportunity['total_cost']:.4f}")
         logger.info(f"Profit per share:     ${opportunity['profit_per_share']:.4f}")
         logger.info(f"Profit %:             {opportunity['profit_pct']:.2f}%")
@@ -262,11 +370,22 @@ class SimpleArbitrageBot:
         
         if self.settings.dry_run:
             logger.info("🔸 SIMULATION MODE - No real orders will be executed")
-            logger.info("=" * 70)
+            
+            # Check simulated balance
+            if self.sim_balance < opportunity['total_investment']:
+                logger.error(f"❌ Insufficient simulated balance: need ${opportunity['total_investment']:.2f} but have ${self.sim_balance:.2f}")
+                return
+            
+            # Deduct from simulated balance
+            self.sim_balance -= opportunity['total_investment']
+            logger.info(f"💰 Simulated balance: ${self.sim_balance:.2f} (after deducting ${opportunity['total_investment']:.2f})")
+            
             # Track simulated investment
             self.total_invested += opportunity['total_investment']
             self.total_shares_bought += opportunity['order_size'] * 2  # UP + DOWN
             self.positions.append(opportunity)
+            self.trades_executed += 1
+            logger.info("=" * 70)
             return
         
         # Check balance before executing (with 20% safety margin)
@@ -443,20 +562,41 @@ class SimpleArbitrageBot:
         time_remaining = self.get_time_remaining()
         if time_remaining == "CLOSED":
             return False  # Signal to stop the bot
-        
-        opportunity = self.check_arbitrage()
+
+        # Fetch both books once per scan (most expensive operations)
+        up_book = self.get_order_book(self.yes_token_id)
+        down_book = self.get_order_book(self.no_token_id)
+
+        opportunity = self.check_arbitrage(up_book=up_book, down_book=down_book)
         
         if opportunity:
             self.execute_arbitrage(opportunity)
             return True
         else:
-            price_up, price_down, size_up, size_down = self.get_current_prices()
-            if price_up and price_down:
-                total = price_up + price_down
-                needed = self.settings.target_pair_cost - total
+            price_up = up_book.get("best_ask")
+            price_down = down_book.get("best_ask")
+            size_up = up_book.get("ask_size", 0)
+            size_down = down_book.get("ask_size", 0)
+
+            if price_up is not None and price_down is not None:
+                best_total = price_up + price_down
+
+                # Compute fill-based totals for ORDER_SIZE (more accurate than best_ask)
+                fill_up = self._compute_buy_fill(up_book.get("asks", []), float(self.settings.order_size))
+                fill_down = self._compute_buy_fill(down_book.get("asks", []), float(self.settings.order_size))
+
+                fill_msg = ""
+                if fill_up and fill_down and fill_up.get("worst") is not None and fill_down.get("worst") is not None:
+                    worst_total = float(fill_up["worst"]) + float(fill_down["worst"])
+                    vwap_total = float(fill_up["vwap"]) + float(fill_down["vwap"]) if (fill_up.get("vwap") is not None and fill_down.get("vwap") is not None) else None
+                    if vwap_total is not None:
+                        fill_msg = f" | fill(worst)=${worst_total:.4f} vwap=${vwap_total:.4f}"
+                    else:
+                        fill_msg = f" | fill(worst)=${worst_total:.4f}"
+
                 logger.info(
                     f"No arbitrage: UP=${price_up:.4f} ({size_up:.0f}) + DOWN=${price_down:.4f} ({size_down:.0f}) "
-                    f"= ${total:.4f} (needs <= ${self.settings.target_pair_cost:.2f}) "
+                    f"= ${best_total:.4f} (threshold=${self.settings.target_pair_cost:.3f}){fill_msg} "
                     f"[Time: {time_remaining}]"
                 )
             return False
@@ -469,7 +609,7 @@ class SimpleArbitrageBot:
         logger.info(f"Market: {self.market_slug}")
         logger.info(f"Time remaining: {self.get_time_remaining()}")
         logger.info(f"Mode: {'🔸 SIMULATION' if self.settings.dry_run else '🔴 REAL TRADING'}")
-        logger.info(f"Cost threshold: ${self.settings.target_pair_cost:.2f}")
+        logger.info(f"Cost threshold: ${self.settings.target_pair_cost:.3f}")
         logger.info(f"Order size: {self.settings.order_size} shares")
         logger.info(f"Interval: {interval_seconds}s")
         logger.info("=" * 70)
@@ -517,7 +657,7 @@ class SimpleArbitrageBot:
                 logger.info(f"Waiting {interval_seconds}s...\n")
                 await asyncio.sleep(interval_seconds)
                 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, asyncio.CancelledError):
             logger.info("\n" + "=" * 70)
             logger.info("🛑 Bot stopped by user")
             logger.info(f"Total scans: {scan_count}")
@@ -541,7 +681,7 @@ async def main():
     # Create and run bot
     try:
         bot = SimpleArbitrageBot(settings)
-        await bot.monitor(interval_seconds=0)
+        await bot.monitor(interval_seconds=0)  # Scan continuously
     except Exception as e:
         logger.error(f"❌ Fatal error: {e}", exc_info=True)
 
