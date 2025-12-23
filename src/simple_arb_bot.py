@@ -869,11 +869,15 @@ class SimpleArbitrageBot:
                     yes_state = client.get_book(self.yes_token_id)
                     no_state = client.get_book(self.no_token_id)
                     if not yes_state or not no_state:
+                        if self.settings.verbose:
+                            logger.info("WSS eval skipped: missing book state (waiting for initial snapshots)")
                         continue
 
                     yes_bids, yes_asks = yes_state.to_levels()
                     no_bids, no_asks = no_state.to_levels()
                     if not yes_asks or not no_asks:
+                        if self.settings.verbose:
+                            logger.info("WSS eval skipped: missing asks on one side (no buyable liquidity yet)")
                         continue
 
                     up_book = self._book_from_state(yes_bids, yes_asks)
@@ -909,6 +913,9 @@ class SimpleArbitrageBot:
                             f"= ${best_total:.4f} (threshold=${self.settings.target_pair_cost:.3f}){fill_msg} "
                             f"[Time: {self.get_time_remaining()}]"
                         )
+                    else:
+                        if self.settings.verbose:
+                            logger.info("WSS eval skipped: best ask missing (book not ready)")
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as e:
