@@ -8,6 +8,7 @@ to guarantee profits regardless of the outcome.
 import asyncio
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -16,6 +17,7 @@ import httpx
 from .config import load_settings
 from .lookup import fetch_market_from_slug
 from .trading import get_client, place_order, get_positions, place_orders_fast
+from .wss_market import MarketWssClient
 
 
 logging.basicConfig(
@@ -51,9 +53,13 @@ def find_current_btc_15min_market() -> str:
         if not matches:
             raise RuntimeError("No active BTC 15min market found")
         
-        # Get the most recent timestamp (the most current market)
-        latest_timestamp = max(int(ts) for ts in matches)
-        slug = f"btc-updown-15m-{latest_timestamp}"
+        # Prefer the most recent timestamp that is still OPEN.
+        # 15min markets close 900s after the timestamp in the slug.
+        now_ts = int(datetime.now().timestamp())
+        all_ts = sorted((int(ts) for ts in matches), reverse=True)
+        open_ts = [ts for ts in all_ts if now_ts < (ts + 900)]
+        chosen_ts = open_ts[0] if open_ts else all_ts[0]
+        slug = f"btc-updown-15m-{chosen_ts}"
         
         logger.info(f"✅ Market found: {slug}")
         return slug
@@ -119,6 +125,9 @@ class SimpleArbitrageBot:
         # Simulation balance (used in dry_run mode)
         self.sim_balance = self.settings.sim_balance if self.settings.sim_balance > 0 else 100.0
         self.sim_start_balance = self.sim_balance
+
+        # Simple cooldown to avoid repeated orders on the same fleeting opportunity
+        self._last_execution_ts = 0.0
     
     def get_time_remaining(self) -> str:
         """Get remaining time until market closes."""
@@ -358,6 +367,13 @@ class SimpleArbitrageBot:
     
     def execute_arbitrage(self, opportunity: dict):
         """Execute arbitrage by buying both sides."""
+
+        # Cooldown guard (applies to both live and dry-run)
+        now = asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else time.time()
+        if self.settings.cooldown_seconds and (now - self._last_execution_ts) < float(self.settings.cooldown_seconds):
+            logger.info(f"Cooldown active ({self.settings.cooldown_seconds}s); skipping execution")
+            return
+        self._last_execution_ts = now
         
         # Count opportunity found (regardless of execution)
         self.opportunities_found += 1
@@ -675,6 +691,9 @@ class SimpleArbitrageBot:
     
     async def monitor(self, interval_seconds: int = 30):
         """Continuously monitor for opportunities."""
+        if getattr(self.settings, "use_wss", False):
+            await self.monitor_wss()
+            return
         logger.info("=" * 70)
         logger.info("🚀 BITCOIN 15MIN ARBITRAGE BOT STARTED")
         logger.info("=" * 70)
@@ -738,6 +757,164 @@ class SimpleArbitrageBot:
             if not self.settings.dry_run:
                 logger.info(f"Trades executed: {self.trades_executed}")
             logger.info("=" * 70)
+
+    def _book_from_state(self, bid_levels: list[tuple[float, float]], ask_levels: list[tuple[float, float]]) -> dict:
+        best_bid = max((p for p, _ in bid_levels), default=None)
+        best_ask = min((p for p, _ in ask_levels), default=None)
+
+        bid_size = 0.0
+        if best_bid is not None:
+            for p, s in bid_levels:
+                if p == best_bid:
+                    bid_size = s
+                    break
+
+        ask_size = 0.0
+        if best_ask is not None:
+            for p, s in ask_levels:
+                if p == best_ask:
+                    ask_size = s
+                    break
+
+        spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
+
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": spread,
+            "bid_size": bid_size,
+            "ask_size": ask_size,
+            "bids": bid_levels,
+            "asks": ask_levels,
+        }
+
+    async def monitor_wss(self):
+        """Monitor using Polymarket CLOB Market WebSocket instead of polling."""
+        # This loop keeps WSS running across market rollovers.
+        while True:
+            # If the detected market is already closed, rollover immediately.
+            if self.get_time_remaining() == "CLOSED":
+                logger.info("\n🚨 Market has closed (before WSS start).")
+                self.show_final_summary()
+                logger.info("\n🔄 Searching for next BTC 15min market...")
+                try:
+                    new_market_slug = find_current_btc_15min_market()
+                    if new_market_slug != self.market_slug:
+                        logger.info(f"✅ New market found: {new_market_slug}")
+                        logger.info("Restarting bot with new market...")
+                        self.__init__(self.settings)
+                        continue
+                    logger.info("⏳ Waiting for new market... (10s)")
+                    await asyncio.sleep(10)
+                    continue
+                except Exception as e:
+                    logger.error(f"Error searching for new market: {e}")
+                    logger.info("Retrying in 10 seconds...")
+                    await asyncio.sleep(10)
+                    continue
+
+            logger.info("=" * 70)
+            logger.info("🚀 BITCOIN 15MIN ARBITRAGE BOT STARTED (WSS MODE)")
+            logger.info("=" * 70)
+            logger.info(f"Market: {self.market_slug}")
+            logger.info(f"Time remaining: {self.get_time_remaining()}")
+            logger.info(f"Mode: {'🔸 SIMULATION' if self.settings.dry_run else '🔴 REAL TRADING'}")
+            logger.info(f"Cost threshold: ${self.settings.target_pair_cost:.3f}")
+            logger.info(f"Order size: {self.settings.order_size} shares")
+            logger.info(f"WSS URL: {self.settings.ws_url}")
+            logger.info("=" * 70)
+            logger.info("")
+
+            client = MarketWssClient(
+                ws_base_url=self.settings.ws_url,
+                asset_ids=[self.yes_token_id, self.no_token_id],
+            )
+
+            last_eval = 0.0
+            eval_min_interval_s = 0.05  # avoid evaluating too frequently on rapid deltas
+            eval_count = 0
+
+            try:
+                async for asset_id, event_type in client.run():
+                    # Periodic close check
+                    if self.get_time_remaining() == "CLOSED":
+                        logger.info("\n🚨 Market has closed!")
+                        self.show_final_summary()
+                        # Roll over to next market
+                        logger.info("\n🔄 Searching for next BTC 15min market...")
+                        try:
+                            new_market_slug = find_current_btc_15min_market()
+                            if new_market_slug != self.market_slug:
+                                logger.info(f"✅ New market found: {new_market_slug}")
+                                logger.info("Restarting bot with new market...")
+                                self.__init__(self.settings)
+                                break
+                            logger.info("⏳ Waiting for new market... (10s)")
+                            await asyncio.sleep(10)
+                            break
+                        except Exception as e:
+                            logger.error(f"Error searching for new market: {e}")
+                            logger.info("Retrying in 10 seconds...")
+                            await asyncio.sleep(10)
+                            break
+
+                    # Debounce evaluation
+                    now = asyncio.get_running_loop().time()
+                    if (now - last_eval) < eval_min_interval_s:
+                        continue
+                    last_eval = now
+                    eval_count += 1
+                    logger.info(f"\n[WSS Eval #{eval_count}] {datetime.now().strftime('%H:%M:%S')} (trigger={event_type}:{asset_id[:8]}…)")
+
+                    yes_state = client.get_book(self.yes_token_id)
+                    no_state = client.get_book(self.no_token_id)
+                    if not yes_state or not no_state:
+                        continue
+
+                    yes_bids, yes_asks = yes_state.to_levels()
+                    no_bids, no_asks = no_state.to_levels()
+                    if not yes_asks or not no_asks:
+                        continue
+
+                    up_book = self._book_from_state(yes_bids, yes_asks)
+                    down_book = self._book_from_state(no_bids, no_asks)
+
+                    opportunity = self.check_arbitrage(up_book=up_book, down_book=down_book)
+                    if opportunity:
+                        self.execute_arbitrage(opportunity)
+                        continue
+
+                    # Minimal "no arb" logging using the same in-memory snapshot
+                    price_up = up_book.get("best_ask")
+                    price_down = down_book.get("best_ask")
+                    size_up = up_book.get("ask_size", 0)
+                    size_down = down_book.get("ask_size", 0)
+
+                    if price_up is not None and price_down is not None:
+                        best_total = float(price_up) + float(price_down)
+                        fill_up = self._compute_buy_fill(up_book.get("asks", []), float(self.settings.order_size))
+                        fill_down = self._compute_buy_fill(down_book.get("asks", []), float(self.settings.order_size))
+
+                        fill_msg = ""
+                        if fill_up and fill_down and fill_up.get("worst") is not None and fill_down.get("worst") is not None:
+                            worst_total = float(fill_up["worst"]) + float(fill_down["worst"])
+                            vwap_total = float(fill_up["vwap"]) + float(fill_down["vwap"]) if (fill_up.get("vwap") is not None and fill_down.get("vwap") is not None) else None
+                            if vwap_total is not None:
+                                fill_msg = f" | fill(worst)=${worst_total:.4f} vwap=${vwap_total:.4f}"
+                            else:
+                                fill_msg = f" | fill(worst)=${worst_total:.4f}"
+
+                        logger.info(
+                            f"No arbitrage: UP=${price_up:.4f} ({size_up:.0f}) + DOWN=${price_down:.4f} ({size_down:.0f}) "
+                            f"= ${best_total:.4f} (threshold=${self.settings.target_pair_cost:.3f}){fill_msg} "
+                            f"[Time: {self.get_time_remaining()}]"
+                        )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as e:
+                logger.warning(f"WSS monitor loop error, reconnecting: {e}")
+                await asyncio.sleep(1.0)
+                continue
 
 
 async def main():

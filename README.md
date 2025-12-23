@@ -51,6 +51,9 @@ Then configure each variable (see detailed explanation below).
 
 ## 🔐 Environment Variables (.env)
 
+> Note: `.env` is loaded without overriding existing environment variables.
+> This means values you set in the terminal / CI will take precedence over `.env`.
+
 ### Required Variables
 
 | Variable | Description | How to Get It |
@@ -74,12 +77,16 @@ Then configure each variable (see detailed explanation below).
 | `TARGET_PAIR_COST` | Maximum combined cost to trigger arbitrage | `0.991` | `0.99` - `0.995` |
 | `ORDER_SIZE` | Number of shares per trade (minimum is 5) | `5` | Start with `5`, increase after testing |
 | `DRY_RUN` | Simulation mode | `true` | Start with `true`, change to `false` for live trading |
+| `SIM_BALANCE` | Starting cash used in simulation mode (`DRY_RUN=true`) | `0` | e.g. `100` |
+| `COOLDOWN_SECONDS` | Minimum seconds between executions | `10` | Increase if you see repeated triggers |
 
 ### Optional
 
 | Variable | Description |
 |----------|-------------|
 | `POLYMARKET_MARKET_SLUG` | Force a specific market slug (leave empty for auto-discovery) |
+| `USE_WSS` | Enable Polymarket Market WebSocket feed (`true`/`false`) |
+| `POLYMARKET_WS_URL` | Base WSS URL (default: `wss://ws-subscriptions-clob.polymarket.com`) |
 
 ---
 
@@ -175,6 +182,30 @@ python -m src.simple_arb_bot
 
 The bot will scan for opportunities but won't place real orders.
 
+### Optional: WebSocket market data (lower latency)
+
+By default the bot polls the CLOB order book over HTTPS. You can optionally enable
+the Polymarket CLOB **Market WebSocket** feed to receive pushed order book updates
+and reduce per-scan latency.
+
+Set the following in your `.env`:
+
+```env
+USE_WSS=true
+POLYMARKET_WS_URL=wss://ws-subscriptions-clob.polymarket.com
+```
+
+Notes on WSS mode:
+- The Market channel can send either a single JSON object or a JSON array (batched events). The bot handles both.
+- If the connection drops or a proxy/firewall blocks WSS, the bot will reconnect and print the error reason.
+- Internally, WSS mode maintains an in-memory L2 book using `book` snapshots + `price_change` deltas.
+
+Then run the bot the same way:
+
+```bash
+python -m src.simple_arb_bot
+```
+
 ### Live trading mode:
 
 1. Change `DRY_RUN=false` in `.env`
@@ -190,7 +221,10 @@ python -m src.simple_arb_bot
 
 ✅ **Auto-discovers** active BTC 15min market  
 ✅ **Detects opportunities** when price_up + price_down < threshold  
+✅ **Execution-aware pricing**: uses order book asks (not last trade price)  
+✅ **Depth-aware sizing**: walks the ask book to ensure `ORDER_SIZE` can fill (uses a conservative “worst fill” price)  
 ✅ **Continuous scanning** with no delays (maximum speed)  
+✅ **Lower latency polling**: fetches UP/DOWN order books concurrently  
 ✅ **Auto-switches** to next market when current one closes  
 ✅ **Final summary** with total investment, profit and market result  
 ✅ **Simulation mode** for risk-free testing  

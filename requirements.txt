@@ -1,6 +1,9 @@
 # Polymarket API client
 py-clob-client
 
+# WebSocket client for market data (CLOB WSS)
+websockets==12.0
+
 # HTTP client for market discovery and price fetching
 httpx==0.27.0
 

@@ -3,8 +3,9 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
-# Load .env file from project root if present; override existing env to prefer .env edits
-load_dotenv(override=True)
+# Load .env file from project root if present.
+# Do NOT override existing environment variables (so CI/terminal env wins over .env).
+load_dotenv(override=False)
 
 
 @dataclass
@@ -20,6 +21,7 @@ class Settings:
     yes_token_id: str = os.getenv("POLYMARKET_YES_TOKEN_ID", "")
     no_token_id: str = os.getenv("POLYMARKET_NO_TOKEN_ID", "")
     ws_url: str = os.getenv("POLYMARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com")
+    use_wss: bool = os.getenv("USE_WSS", "false").lower() == "true"
     target_pair_cost: float = float(os.getenv("TARGET_PAIR_COST", "0.99"))
     balance_slack: float = float(os.getenv("BALANCE_SLACK", "0.15"))
     order_size: float = float(os.getenv("ORDER_SIZE", "50"))
