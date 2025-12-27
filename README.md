@@ -316,7 +316,6 @@ Bot/
 
 ### "Invalid signature" error
 - Verify `POLYMARKET_SIGNATURE_TYPE` matches your wallet type
-- For Magic.link users: set `POLYMARKET_FUNDER=0x9D80964BDB2eB1D7106c2D2E8eAffB9F3e5D6Fb1`
 - Regenerate API credentials with `python -m src.generate_api_key`
 
 ### Balance shows $0 but I have funds
@@ -337,6 +336,16 @@ Bot/
 - [Polymarket](https://polymarket.com/)
 - [BTC 15min Markets](https://polymarket.com/crypto/15M)
 - [py-clob-client documentation](https://github.com/Polymarket/py-clob-client)
+
+---
+
+## 💰 Donations
+
+If you find this project helpful, consider supporting me with a donation:
+
+- **Bitcoin**: bc1q7g34820ja90aeltmlkc7va04eqk7u0z7830hdt
+- **Ethereum**: 0x2536eF5E8613dec01b7919A6a7933053da027414
+- **PayPal**: https://www.paypal.me/jonmarcos17 
 
 ---
 
