@@ -16,7 +16,15 @@ import httpx
 
 from .config import load_settings
 from .lookup import fetch_market_from_slug
-from .trading import get_client, place_order, get_positions, place_orders_fast
+from .trading import (
+    get_client,
+    place_order,
+    get_positions,
+    place_orders_fast,
+    extract_order_id,
+    wait_for_terminal_order,
+    cancel_orders,
+)
 from .wss_market import MarketWssClient
 
 
@@ -438,7 +446,7 @@ class SimpleArbitrageBot:
         
         try:
             # Execute orders
-            logger.info("\n📤 Executing orders IN PARALLEL...")
+            logger.info("\n📤 Submitting both legs...")
             
             # Use exact prices from arbitrage opportunity
             up_price = opportunity['price_up']
@@ -462,39 +470,93 @@ class SimpleArbitrageBot:
             
             logger.info(f"   UP:   {self.settings.order_size} shares @ ${up_price:.4f}")
             logger.info(f"   DOWN: {self.settings.order_size} shares @ ${down_price:.4f}")
+            logger.info(f"   OrderType: {getattr(self.settings, 'order_type', 'GTC')}")
             
             # Execute both orders as fast as possible
-            results = place_orders_fast(self.settings, orders)
-            
-            # Check results
-            errors = [r for r in results if isinstance(r, dict) and "error" in r]
-            if errors:
-                for err in errors:
-                    logger.error(f"❌ Order error: {err['error']}")
-                raise RuntimeError(f"Some orders failed: {errors}")
-            
-            logger.info(f"✅ UP order executed")
-            logger.info(f"✅ DOWN order executed")
-            
-            # Verify positions are balanced
-            import time
-            time.sleep(1)  # Wait for orders to settle
-            
-            positions = get_positions(self.settings, [self.yes_token_id, self.no_token_id])
-            up_shares = positions.get(self.yes_token_id, {}).get("size", 0)
-            down_shares = positions.get(self.no_token_id, {}).get("size", 0)
-            
-            if abs(up_shares - down_shares) > 0.1:
-                logger.warning(f"⚠️ POSITION IMBALANCE DETECTED!")
-                logger.warning(f"   UP shares: {up_shares:.2f}")
-                logger.warning(f"   DOWN shares: {down_shares:.2f}")
-                logger.warning(f"   Difference: {abs(up_shares - down_shares):.2f}")
-                logger.warning("   ⚠️ Manual intervention may be needed to balance positions")
-            
+            results = place_orders_fast(self.settings, orders, order_type=getattr(self.settings, 'order_type', 'GTC'))
+
+            # Extract order ids and surface any immediate submission errors.
+            # Preserve index mapping: orders[0] is UP, orders[1] is DOWN.
+            submission_errors: list[str] = []
+            order_ids_by_idx: list[Optional[str]] = [None, None]
+            for idx, r in enumerate((results or [])[:2]):
+                if isinstance(r, dict) and "error" in r:
+                    submission_errors.append(str(r.get("error")))
+                    continue
+                oid = extract_order_id(r) if isinstance(r, dict) else None
+                order_ids_by_idx[idx] = oid
+
+            if submission_errors:
+                for msg in submission_errors:
+                    logger.error(f"❌ Order submit error: {msg}")
+
+            if not order_ids_by_idx[0] or not order_ids_by_idx[1]:
+                # Can't reliably verify fills without ids; treat as failure.
+                raise RuntimeError(f"Could not extract both order ids from responses: {results}")
+
+            logger.info("✅ Submitted 2 orders; verifying fills...")
+
+            # We know we submitted in order: UP first, DOWN second.
+            up_order_id, down_order_id = order_ids_by_idx[0], order_ids_by_idx[1]
+            req_size = float(self.settings.order_size)
+
+            up_state = wait_for_terminal_order(self.settings, up_order_id, requested_size=req_size)
+            down_state = wait_for_terminal_order(self.settings, down_order_id, requested_size=req_size)
+
+            up_filled = bool(up_state.get("filled"))
+            down_filled = bool(down_state.get("filled"))
+            up_filled_size = float(up_state.get("filled_size") or 0.0)
+            down_filled_size = float(down_state.get("filled_size") or 0.0)
+
+            logger.info(
+                f"Order status: UP(id={up_order_id}, status={up_state.get('status')}, filled={up_filled_size:.4f}) | "
+                f"DOWN(id={down_order_id}, status={down_state.get('status')}, filled={down_filled_size:.4f})"
+            )
+
+            if submission_errors or not (up_filled and down_filled):
+                # Best-effort cleanup: cancel anything still open
+                try:
+                    cancel_orders(self.settings, [up_order_id, down_order_id])
+                except Exception as cancel_exc:
+                    logger.warning(f"Cancel cleanup failed: {cancel_exc}")
+
+                # If one leg filled, attempt to flatten exposure immediately.
+                filled_token_id = None
+                filled_size = 0.0
+                if up_filled and not down_filled:
+                    filled_token_id = self.yes_token_id
+                    filled_size = up_filled_size if up_filled_size > 0 else req_size
+                elif down_filled and not up_filled:
+                    filled_token_id = self.no_token_id
+                    filled_size = down_filled_size if down_filled_size > 0 else req_size
+
+                if filled_token_id and filled_size > 0:
+                    logger.warning("⚠️ Partial fill detected; attempting to flatten exposure (SELL filled leg)")
+                    try:
+                        book = self.get_order_book(filled_token_id)
+                        best_bid = book.get("best_bid")
+                        if best_bid is None:
+                            raise RuntimeError("No best_bid available to unwind")
+                        # Marketable limit sell: price at or below best_bid.
+                        # Use FAK so we reduce exposure even if the bid is thin.
+                        place_order(
+                            self.settings,
+                            side="SELL",
+                            token_id=filled_token_id,
+                            price=float(best_bid),
+                            size=float(filled_size),
+                            tif="FAK",
+                        )
+                        logger.info(f"Submitted unwind SELL for {filled_size:.4f} @ bid={best_bid:.4f} (FAK)")
+                    except Exception as unwind_exc:
+                        logger.error(f"❌ Unwind attempt failed: {unwind_exc}")
+
+                raise RuntimeError("Paired execution failed (not both legs filled)")
+
             logger.info("\n" + "=" * 70)
-            logger.info("✅ ARBITRAGE EXECUTED SUCCESSFULLY")
+            logger.info("✅ ARBITRAGE EXECUTED (BOTH LEGS FILLED)")
             logger.info("=" * 70)
-            
+
             self.trades_executed += 1
             
             # Track real investment

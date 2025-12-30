@@ -76,6 +76,7 @@ Then configure each variable (see detailed explanation below).
 |----------|-------------|---------|-------------|
 | `TARGET_PAIR_COST` | Maximum combined cost to trigger arbitrage | `0.991` | `0.99` - `0.995` |
 | `ORDER_SIZE` | Number of shares per trade (minimum is 5) | `5` | Start with `5`, increase after testing |
+| `ORDER_TYPE` | Order time-in-force (`FOK`, `FAK`, `GTC`) | `FOK` | Use `FOK` to avoid leaving one leg open |
 | `DRY_RUN` | Simulation mode | `true` | Start with `true`, change to `false` for live trading |
 | `SIM_BALANCE` | Starting cash used in simulation mode (`DRY_RUN=true`) | `0` | e.g. `100` |
 | `COOLDOWN_SECONDS` | Minimum seconds between executions | `10` | Increase if you see repeated triggers |
@@ -215,6 +216,23 @@ python -m src.simple_arb_bot
 python -m src.simple_arb_bot
 ```
 
+### Paired execution safety (avoids “one-leg fills”)
+
+In real trading, it’s possible for **only one leg** (UP or DOWN) to fill if the book moves.
+To reduce the risk of ending up with an imbalanced position, the bot now:
+
+- **Submits both legs**, then **verifies** each order by polling `get_order`.
+- Only logs **“EXECUTED (BOTH LEGS FILLED)”** and increments `trades_executed` when **both** legs are confirmed filled.
+- If only one leg fills, it will **best-effort cancel** the remaining order(s) and attempt to **flatten exposure** by submitting a
+   `SELL` on the filled leg at the current `best_bid` using `FAK` (fill-and-kill).
+
+Recommendation:
+- Keep `ORDER_TYPE=FOK` for entries (fill-or-kill) to avoid leaving open orders.
+
+Important:
+- This is **risk-reduction**, not a perfect guarantee. In fast markets, unwind orders can also fail or partially fill.
+- Always monitor your positions on Polymarket, especially if you see a “Partial fill detected” warning.
+
 ---
 
 ## 📊 Features
@@ -229,6 +247,7 @@ python -m src.simple_arb_bot
 ✅ **Final summary** with total investment, profit and market result  
 ✅ **Simulation mode** for risk-free testing  
 ✅ **Balance verification** before executing trades  
+✅ **Paired execution verification**: confirms both legs filled (otherwise cancels + attempts to unwind)  
 
 ---
 

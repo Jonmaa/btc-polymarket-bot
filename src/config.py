@@ -25,6 +25,7 @@ class Settings:
     target_pair_cost: float = float(os.getenv("TARGET_PAIR_COST", "0.99"))
     balance_slack: float = float(os.getenv("BALANCE_SLACK", "0.15"))
     order_size: float = float(os.getenv("ORDER_SIZE", "50"))
+    order_type: str = os.getenv("ORDER_TYPE", "FOK").upper()
     yes_buy_threshold: float = float(os.getenv("YES_BUY_THRESHOLD", "0.45"))
     no_buy_threshold: float = float(os.getenv("NO_BUY_THRESHOLD", "0.45"))
     verbose: bool = os.getenv("VERBOSE", "false").lower() == "true"
