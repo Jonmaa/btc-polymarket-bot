@@ -68,7 +68,25 @@ Then configure each variable (see detailed explanation below).
 | Variable | Description | Value |
 |----------|-------------|-------|
 | `POLYMARKET_SIGNATURE_TYPE` | Type of wallet signature | `0` = EOA (MetaMask, hardware wallet)<br>`1` = Magic.link (email login on Polymarket)<br>`2` = Gnosis Safe |
-| `POLYMARKET_FUNDER` | Proxy wallet address (only for Magic.link users) | Leave **empty** for EOA wallets. For Magic.link, go to your profile https://polymarket.com/@{}, and click 'Copy address' |
+| `POLYMARKET_FUNDER` | Proxy wallet address (only for Magic.link users) | Leave **empty** for EOA wallets. For Magic.link, see instructions below. |
+
+#### ⚠️ Important: Magic.link users (signature_type=1)
+
+If you use **email login** on Polymarket (Magic.link), you have **two addresses**:
+
+1. **Signer address** (derived from your private key): This is the wallet that signs transactions.
+2. **Proxy wallet address** (POLYMARKET_FUNDER): This is where your funds actually live on Polymarket.
+
+**To find your proxy wallet address:**
+1. Go to your Polymarket profile: `https://polymarket.com/@YOUR_USERNAME`
+2. Click the **"Copy address"** button next to your balance
+3. This is your `POLYMARKET_FUNDER` — it should look like `0x...` and is **different** from your signer address
+
+**Common mistake:** Setting `POLYMARKET_FUNDER` to your Polygon wallet address (where you might have USDC on-chain) instead of the Polymarket proxy address. This causes `"invalid signature"` errors.
+
+**How to verify:** Run `python -m src.test_balance`:
+- "Getting USDC balance" shows the balance via Polymarket API (should show your funds)
+- "Balance on-chain" queries Polygon directly (may show $0 if your funds are in the proxy, which is normal)
 
 ### Trading Configuration
 
@@ -127,7 +145,32 @@ POLYMARKET_API_PASSPHRASE=mypassphrase
 
 ---
 
-## 💰 Checking Your Balance
+## � Diagnosing Configuration Issues
+
+If you get `"invalid signature"` errors, run the diagnostic tool:
+
+```bash
+python -m src.diagnose_config
+```
+
+This will check:
+- Whether your `POLYMARKET_FUNDER` is correctly set (required for Magic.link accounts)
+- Whether the signer and funder addresses are different (they should be for Magic.link)
+- Whether the bot can detect `neg_risk` for BTC 15min markets
+- Your current USDC balance via the Polymarket API
+
+**Common causes of "invalid signature":**
+1. `POLYMARKET_FUNDER` is empty for Magic.link accounts
+2. `POLYMARKET_FUNDER` is set to your Polygon wallet address instead of your Polymarket proxy wallet
+3. API credentials were generated with a different private key or configuration
+4. The `neg_risk` flag is incorrectly detected (fixed in latest version - bot now forces `neg_risk=True` for BTC 15min markets)
+
+**About "Balance on-chain" showing $0:**
+This is **normal** for Magic.link accounts. Your funds are held in a Polymarket proxy contract, not directly in your Polygon wallet. The "USDC balance" via API should show your correct balance.
+
+---
+
+## �💰 Checking Your Balance
 
 Before trading, verify that your wallet is configured correctly and has funds:
 

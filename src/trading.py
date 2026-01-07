@@ -4,7 +4,14 @@ from typing import Optional
 import time
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import BalanceAllowanceParams, AssetType, OrderArgs, OrderType, PostOrdersArgs
+from py_clob_client.clob_types import (
+    BalanceAllowanceParams,
+    AssetType,
+    OrderArgs,
+    OrderType,
+    PostOrdersArgs,
+    PartialCreateOrderOptions,
+)
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from .config import Settings
@@ -95,9 +102,11 @@ def place_order(settings: Settings, *, side: str, token_id: str, price: float, s
             side=BUY if side_up == "BUY" else SELL
         )
         
-        # DO NOT use PartialCreateOrderOptions(neg_risk=True) - it causes "invalid signature"
-        # The client will auto-detect neg_risk from the token_id
-        signed_order = client.create_order(order_args)
+        # BTC 15min markets are neg_risk but auto-detection via /neg-risk endpoint
+        # often fails (returns "Invalid token id"). Force neg_risk=True for these markets.
+        # This is safe: the worst case for non-neg_risk markets is a rejected order, not a bad signature.
+        options = PartialCreateOrderOptions(neg_risk=True)
+        signed_order = client.create_order(order_args, options)
         
         tif_up = (tif or "GTC").upper()
         order_type = getattr(OrderType, tif_up, OrderType.GTC)
@@ -127,6 +136,8 @@ def place_orders_fast(settings: Settings, orders: list[dict], *, order_type: str
     ot = getattr(OrderType, tif_up, OrderType.GTC)
 
     # Step 1: Pre-sign all orders (this is the slow part)
+    # Force neg_risk=True for BTC 15min markets (auto-detection fails)
+    options = PartialCreateOrderOptions(neg_risk=True)
     signed_orders = []
     for order_params in orders:
         side_up = order_params["side"].upper()
@@ -136,7 +147,7 @@ def place_orders_fast(settings: Settings, orders: list[dict], *, order_type: str
             size=order_params["size"],
             side=BUY if side_up == "BUY" else SELL,
         )
-        signed_order = client.create_order(order_args)
+        signed_order = client.create_order(order_args, options)
         signed_orders.append(signed_order)
 
     # Step 2: Post all orders in a single request when possible.
